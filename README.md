@@ -2,8 +2,6 @@
 
 A set of scripts using MDAnalysis that works on the following assumptions to calculate **RMSD**, **2D-RMSD**, **RMSF**, **RoG** and **HB**.
 
-> **Note:** We're going to discard 500 frames that functioned as equilibration, accounting for 5 ns out of 100 ns.
-
 ## Analysis Requirements
 
 1. **Basic Configuration**
