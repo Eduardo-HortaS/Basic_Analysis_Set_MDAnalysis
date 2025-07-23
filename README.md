@@ -47,3 +47,7 @@ A set of scripts using MDAnalysis that works on the following assumptions to cal
 ## Configuration
 
 Configuration is delegated to a JSON.
+
+
+
+[![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.16389354.svg)](https://doi.org/10.5281/zenodo.16389354)
