@@ -2,9 +2,11 @@ import os
 import pickle
 import argparse
 import json
+import numpy as np
 import MDAnalysis as mda
 from MDAnalysis.analysis import rms, diffusionmap
-from utils import transform_trajectory, align_trajectory
+from utils import transform_trajectory, align_trajectory, build_complex_selection, convert_time_from_ps, validate_time_unit, SUPPORTED_TIME_UNITS
+from parallelization import ParallelConfig, get_run_kwargs, safe_run
 
 # Example selection strings for different RMS* analyses:
 
@@ -20,11 +22,144 @@ from utils import transform_trajectory, align_trajectory
 #   target_selection = 'protein and backbone' # Atoms to calculate distance matrix for
 
 
-def run_rms_analysis(systems, variations, num_replicates, analysis, target_selection, ref_selection, start_frame, traj_format, group_selections=None):
+def validate_chain_intervals(universe, chain_intervals, target_selection):
+    """
+    Validates that chain_intervals resids (1-based, PDB-style) exist in the trajectory
+    and are consistent with the target selection.
+
+    Parameters
+    ----------
+    universe : mda.Universe
+        The loaded MDAnalysis Universe.
+    chain_intervals : dict
+        Mapping of chain ID to [start_resid, end_resid] (1-based inclusive).
+        Example: {"A": [1, 120], "B": [121, 239]}
+    target_selection : str
+        MDAnalysis selection string for the target atoms.
+
+    Raises
+    ------
+    ValueError
+        If any interval's resids are not found in the trajectory or are invalid.
+    """
+    target_atoms = universe.select_atoms(target_selection)
+    available_resids = set(target_atoms.residues.resids)
+
+    all_chain_resids = []
+    for chain_id, (start_resid, end_resid) in chain_intervals.items():
+        if start_resid < 1:
+            raise ValueError(
+                f"Chain '{chain_id}': start_resid={start_resid} is less than 1. "
+                f"Chain intervals must use 1-based (PDB-style) residue IDs."
+            )
+        if start_resid > end_resid:
+            raise ValueError(
+                f"Chain '{chain_id}': start_resid={start_resid} > end_resid={end_resid}."
+            )
+
+        chain_resids = set(range(start_resid, end_resid + 1))
+        missing = chain_resids - available_resids
+        if missing:
+            missing_sorted = sorted(missing)
+            raise ValueError(
+                f"Chain '{chain_id}': resids {missing_sorted[:10]}{'...' if len(missing_sorted) > 10 else ''} "
+                f"not found in target selection '{target_selection}'. "
+                f"Available resid range: {min(available_resids)}-{max(available_resids)}."
+            )
+
+        all_chain_resids.append((chain_id, chain_resids))
+
+    # Check for overlaps
+    for i, (id_a, resids_a) in enumerate(all_chain_resids):
+        for j, (id_b, resids_b) in enumerate(all_chain_resids):
+            if i >= j:
+                continue
+            overlap = resids_a & resids_b
+            if overlap:
+                print(f"WARNING: Chain '{id_a}' and chain '{id_b}' have overlapping resids: {sorted(overlap)[:10]}")
+
+    # Check for gaps
+    covered = set()
+    for _, resids in all_chain_resids:
+        covered |= resids
+    uncovered = available_resids - covered
+    if uncovered:
+        print(f"WARNING: Resids {sorted(uncovered)[:10]}{'...' if len(uncovered) > 10 else ''} "
+              f"from target selection are not covered by any chain interval.")
+
+
+def run_rms_analysis(systems, variations, num_replicates, analysis, target_selection, ref_selection,
+                     start_frame, traj_format, top_format='top', group_selections=None, chain_intervals=None,
+                     time_interval_between_frames=None, time_unit='ns', ref_suffix='', wrap_selection='auto',
+                     output_dir=None, parallel_backend='serial', n_workers=None):
     """
     After external transforming and aligning of trajectory data for each analysis, system, variation and replicate,
     runs the respective analysis (RMSD (2D and conventional) | RMSF) and saves results as individual pickle files.
+
+    Parameters
+    ----------
+    systems : list
+        List of system names.
+    variations : dict
+        Mapping of system name to list of variations.
+    num_replicates : int
+        Number of replicates per system/variation.
+    analysis : str
+        Type of analysis: 'RMSD', 'RMSF', or '2D-RMSD'.
+    target_selection : str
+        MDAnalysis selection string for target atoms.
+    ref_selection : str
+        MDAnalysis selection string for reference atoms (alignment).
+    start_frame : int
+        Starting frame for analysis (skip equilibration).
+    traj_format : str
+        Trajectory file format (e.g., 'dcd', 'xtc').
+    group_selections : list of str, optional
+        Additional group selections for RMSD analysis.
+    chain_intervals : dict, optional
+        For RMSF chain split. Supports two formats:
+        - Per-system: maps system name to chain dict.
+          Example: {"Ung_G-C_4": {"A": [1, 239]}, "Mug_G-C_4": {"A": [1, 211]}}
+        - Legacy flat: maps chain ID to [start_resid, end_resid] (1-based).
+          Example: {"A": [1, 120], "B": [121, 239]}
+          Applied identically to every system.
+    time_interval_between_frames : float, optional
+        Time interval between frames in picoseconds. Used for DCD time-axis correction
+        in RMSD analysis. When provided and traj_format is 'dcd', recalculates the
+        time column of RMSD results.
+    time_unit : str, optional
+        Output time unit for the corrected time axis.  Accepted values:
+        'fs', 'ps', 'ns', 'us', 'ms', 's'.  Default: 'ns'.
+    ref_suffix : str, optional
+        Suffix to append to pickle filenames for distinguishing different
+        ref_selection iterations (e.g., '_ref0', '_ref1').  Default: ''.
+    wrap_selection : str or None, optional
+        Controls PBC wrapping.  ``'auto'`` (default) unwraps/centres on
+        protein and wraps everything else.  ``None`` disables wrapping.
+        Any other string is an MDAnalysis selection for atoms to wrap.
+    output_dir : str or None, optional
+        Directory for pickle output.  When *None*, pickles are written
+        to the current working directory.
+    parallel_backend : str, optional
+        MDAnalysis parallel backend: ``'serial'`` (default),
+        ``'multiprocessing'``, or ``'dask'``.  Only RMSD supports
+        non-serial backends; RMSF and 2D-RMSD always run serially.
+    n_workers : int or None, optional
+        Number of parallel workers.  ``None`` auto-detects.
     """
+    validate_time_unit(time_unit)
+    if output_dir:
+        os.makedirs(output_dir, exist_ok=True)
+    _pkl = (lambda name: os.path.join(output_dir, name)) if output_dir else (lambda name: name)
+
+    # Build parallelisation config — only RMSD supports parallel backends.
+    # RMSF and 2D-RMSD always run serially, so we only create the config
+    # when the analysis actually uses it.
+    run_kwargs: dict = {}
+    if analysis == 'RMSD':
+        parallel_cfg = ParallelConfig(backend=parallel_backend, n_workers=n_workers)
+        run_kwargs = get_run_kwargs(parallel_cfg, analysis_key='RMSD')
+
     print(f"--- Starting {analysis} calculation for each system, condition, and replicate... ---")
 
     reps = range(1, num_replicates + 1)
@@ -38,56 +173,252 @@ def run_rms_analysis(systems, variations, num_replicates, analysis, target_selec
     for system in systems:
         for variation in variations[system]:
             for rep in reps:
-                pickle_file = f'{analysis_file_prefix[analysis]}_{system}_{variation}_rep{rep}.pkl'
-                if os.path.exists(pickle_file):
-                    print(f"Skipping {analysis} for {system}, {variation}, replicate {rep} because the data already exists in {pickle_file}.")
-                    continue
+                # Resolve per-system chain intervals
+                system_chain_intervals = None
+                if chain_intervals is not None:
+                    system_chain_intervals = chain_intervals.get(system)
+                    if system_chain_intervals is None:
+                        # Legacy flat format: the dict itself is the chain map
+                        first_val = next(iter(chain_intervals.values()))
+                        if isinstance(first_val, list):
+                            system_chain_intervals = chain_intervals
+
+                # Determine if we should skip based on existing files
+                # (RMSD handles its own skip-if-exists per selection inside the RMSD block)
+                if analysis == 'RMSD':
+                    pass  # skip logic is per-selection inside the RMSD block
+                elif analysis == 'RMSF' and system_chain_intervals is not None:
+                    # Check if all chain pickles exist
+                    chain_pickles_exist = all(
+                        os.path.exists(_pkl(f'{analysis_file_prefix[analysis]}_{system}_{variation}_rep{rep}_chain{chain_id}.pkl'))
+                        for chain_id in system_chain_intervals
+                    )
+                    if chain_pickles_exist:
+                        print(f"Skipping {analysis} for {system}, {variation}, replicate {rep} because all chain data files already exist.")
+                        continue
+                else:
+                    pickle_file = _pkl(f'{analysis_file_prefix[analysis]}_{system}_{variation}_rep{rep}.pkl')
+                    if os.path.exists(pickle_file):
+                        print(f"Skipping {analysis} for {system}, {variation}, replicate {rep} because the data already exists in {pickle_file}.")
+                        continue
 
                 print(f"Processing {system}, {variation}, replicate {rep}.")
                 traj_file = f'{system}/{variation}/{system}_production_{variation}_rep_{rep}.{traj_format}'
                 aligned_traj_file = f'rmsfit_{system}_production_{variation}_reduced_rep{rep}.{traj_format}'
-                top_file = f'{system}/{variation}/{system}_system_{variation}.top'
+                top_file = f'{system}/{variation}/{system}_system_{variation}.{top_format}'
 
                 if analysis == 'RMSD':
                     u = mda.Universe(top_file, traj_file)
-                    to_run_rmsd = rms.RMSD(u, u, select=target_selection, groupselections=group_selections, ref_frame=0)
-                    to_run_rmsd.run(start=start_frame, stop=None, step=1)
 
-                    with open(f'{analysis_file_prefix[analysis]}_{system}_{variation}_rep{rep}.pkl', 'wb') as f:
-                        pickle.dump(to_run_rmsd, f)
+                    # Unwrap, center, and wrap the trajectory to handle
+                    # periodic boundary artifacts.  wrap_selection
+                    # controls which atoms are wrapped back into the
+                    # primary image (default: everything non-protein).
+                    complex_ag, ligand_ag, rest_ag = build_complex_selection(
+                        u, wrap_selection=wrap_selection)
+                    if complex_ag is not None:
+                        transform_trajectory(u, complex_ag, rest_ag,
+                                             ligand_selection=ligand_ag)
+
+                    # Build list of selections to run independently.
+                    # When group_selections is provided, each entry produces
+                    # a separate RMSD calculation and pickle file.
+                    # When group_selections is None/empty, use target_selection.
+                    if group_selections:
+                        rmsd_selections = list(group_selections)
+                    else:
+                        rmsd_selections = [target_selection]
+
+                    for sel_idx, sel_string in enumerate(rmsd_selections):
+                        # Determine pickle filename
+                        if len(rmsd_selections) > 1:
+                            pkl_name = _pkl(f'{analysis_file_prefix[analysis]}_{system}_{variation}_rep{rep}{ref_suffix}_sel{sel_idx}.pkl')
+                        else:
+                            pkl_name = _pkl(f'{analysis_file_prefix[analysis]}_{system}_{variation}_rep{rep}{ref_suffix}.pkl')
+
+                        if os.path.exists(pkl_name):
+                            print(f"Skipping RMSD (selection {sel_idx}: '{sel_string}') for {system}, {variation}, replicate {rep} — pickle already exists.")
+                            continue
+
+                        # Validate that the selection exists in the universe
+                        try:
+                            sel_atoms = u.select_atoms(sel_string)
+                        except Exception as e:
+                            print(f"WARNING: Selection '{sel_string}' raised an error for {system}/{variation} rep {rep}: {e} — skipping this selection.")
+                            continue
+                        if len(sel_atoms) == 0:
+                            print(f"WARNING: Selection '{sel_string}' matched 0 atoms in {system}/{variation} rep {rep} — skipping this selection.")
+                            continue
+
+                        # Use ref_selection for structural alignment.
+                        # When ref_selection differs from sel_string, align on
+                        # ref_selection and compute RMSD on sel_string via
+                        # groupselections.
+                        if ref_selection != sel_string:
+                            print(f"  Running RMSD with alignment='{ref_selection}', target='{sel_string}' (sel{sel_idx})...")
+                            to_run_rmsd = rms.RMSD(u, u, select=ref_selection,
+                                                   groupselections=[sel_string],
+                                                   ref_frame=0)
+                        else:
+                            print(f"  Running RMSD with selection '{sel_string}' (sel{sel_idx})...")
+                            to_run_rmsd = rms.RMSD(u, u, select=sel_string, ref_frame=0)
+                        safe_run(to_run_rmsd, run_kwargs, start=start_frame, stop=None, step=1)
+
+                        # When groupselections was used, the target RMSD is in
+                        # column 3 (col 2 = alignment RMSD).  Normalize so
+                        # column 2 always holds the target RMSD for downstream
+                        # plotting compatibility.
+                        if ref_selection != sel_string:
+                            rmsd_raw = to_run_rmsd.results.rmsd
+                            # Keep [frame, time, target_rmsd] — drop alignment col
+                            to_run_rmsd.results.rmsd = np.column_stack([
+                                rmsd_raw[:, 0], rmsd_raw[:, 1], rmsd_raw[:, 3]
+                            ])
+
+                        # DCD time-axis correction: recalculate time column when DCD format is used
+                        if traj_format.lower() == 'dcd' and time_interval_between_frames is not None:
+                            print(f"Applying DCD time-axis correction (dt={time_interval_between_frames} ps, output unit={time_unit})...")
+                            rmsd_data = to_run_rmsd.results.rmsd
+                            # Column 0 = frame, Column 1 = time, Column 2+ = RMSD values
+                            frame_numbers = rmsd_data[:, 0]
+                            corrected_time = frame_numbers * time_interval_between_frames  # time in ps
+                            corrected_time = convert_time_from_ps(corrected_time, time_unit)
+                            rmsd_data[:, 1] = corrected_time
+
+                        # Store portable data (arrays + metadata) to avoid
+                        # pickling MDAnalysis runtime objects tied to local
+                        # trajectory paths.
+                        rmsd_result = {
+                            'rmsd_data': np.asarray(to_run_rmsd.results.rmsd),
+                            'time_corrected': time_interval_between_frames is not None and traj_format.lower() == 'dcd',
+                            'time_unit': time_unit if (time_interval_between_frames is not None and traj_format.lower() == 'dcd') else 'ps',
+                            'time_interval_between_frames': time_interval_between_frames,
+                            'selection': sel_string,
+                            'ref_selection': ref_selection,
+                        }
+
+                        with open(pkl_name, 'wb') as f:
+                            pickle.dump(rmsd_result, f)
+                        print(f"  Saved RMSD pickle: {pkl_name}")
+
+                    # Create aligned trajectory for reuse by subsequent
+                    # RMSF / 2D-RMSD runs.  This avoids re-loading the
+                    # raw trajectory and re-computing PBC corrections.
+                    if not os.path.exists(aligned_traj_file):
+                        print(f"Creating aligned trajectory: {aligned_traj_file}")
+                        # Reset to frame 0 so AlignTraj uses a deterministic
+                        # reference regardless of whether RMSD ran serially
+                        # (leaves trajectory at last frame) or in parallel
+                        # (leaves trajectory at frame 0).
+                        u.trajectory[0]
+                        align_trajectory(u, ref_selection, '2D-RMSD', system,
+                                         variation, rep, traj_format, start_frame)
+
+                    # Skip the rest of this rep iteration for RMSD
+                    continue
 
                 else:  # For RMSF and 2D-RMSD, we need to check if the aligned trajectory already exists.
                     if os.path.exists(aligned_traj_file):
                         print(f"Using pre-aligned trajectory: {aligned_traj_file}")
                         u = mda.Universe(top_file, aligned_traj_file)
-                        target_selection = u.select_atoms(target_selection)
-                        ref_selection = u.select_atoms(ref_selection)
-                        transform_trajectory(u, target_selection, ref_selection)
                     else:
                         print(f"Aligned trajectory file {aligned_traj_file} does not exist. Creating it now.")
                         u = mda.Universe(top_file, traj_file)
+
+                        # Apply PBC corrections *before* alignment so that
+                        # periodic-image artifacts are not baked into the
+                        # aligned trajectory.
+                        pre_complex_ag, pre_ligand_ag, pre_rest_ag = build_complex_selection(
+                            u, wrap_selection=wrap_selection)
+                        if pre_complex_ag is not None:
+                            transform_trajectory(u, pre_complex_ag, pre_rest_ag,
+                                                 ligand_selection=pre_ligand_ag)
+
                         align_trajectory(u, target_selection, analysis, system, variation, rep, traj_format, start_frame)
                         del u
                         u = mda.Universe(top_file, aligned_traj_file)
-                        target_selection = u.select_atoms(target_selection)
-                        ref_selection = u.select_atoms(ref_selection)
-                        transform_trajectory(u, target_selection, ref_selection)
+
+                    # PBC handling: wrap_selection controls which atoms
+                    # are wrapped back into the primary image.
+                    complex_ag, ligand_ag, rest_ag = build_complex_selection(
+                        u, wrap_selection=wrap_selection)
+                    if complex_ag is not None:
+                        transform_trajectory(u, complex_ag, rest_ag,
+                                             ligand_selection=ligand_ag)
 
                     if analysis == 'RMSF':
-                        # TODO: Implement protein chain split to avoid considering the movements of all chains as a single entity.
                         print("Calculating RMSF...")
-                        u_rmsf_backbone = u.select_atoms(target_selection)
-                        to_run_rmsf = rms.RMSF(u_rmsf_backbone).run()
+                        rmsf_atoms = u.select_atoms(target_selection)
+                        to_run_rmsf = rms.RMSF(rmsf_atoms).run()
 
-                        with open(f'{analysis_file_prefix[analysis]}_{system}_{variation}_rep{rep}.pkl', 'wb') as f:
-                            pickle.dump(to_run_rmsf, f)
+                        # rms.RMSF computes per-ATOM fluctuations.  Convert to
+                        # per-RESIDUE by averaging atom RMSF values within each
+                        # residue — this is the standard for publication plots.
+                        rmsf_values_atoms = to_run_rmsf.results.rmsf
+                        atom_resids = np.array([atom.resid for atom in rmsf_atoms])
+
+                        def _per_residue_rmsf(resid_list):
+                            """Average atom-level RMSF for each residue in *resid_list*."""
+                            rmsf_list, kept_resids = [], []
+                            for resid in resid_list:
+                                mask = atom_resids == resid
+                                vals = rmsf_values_atoms[mask]
+                                if vals.size == 0:
+                                    continue
+                                rmsf_list.append(np.mean(vals))
+                                kept_resids.append(resid)
+                            return np.array(rmsf_list), np.array(kept_resids)
+
+                        if system_chain_intervals is not None:
+                            # Validate chain intervals against the trajectory
+                            validate_chain_intervals(u, system_chain_intervals, target_selection)
+
+                            # Split RMSF results by chain
+                            for chain_id, (start_resid, end_resid) in system_chain_intervals.items():
+                                present_resids = [r for r in range(start_resid, end_resid + 1)
+                                                  if r in set(atom_resids)]
+                                chain_rmsf, chain_original_resids = _per_residue_rmsf(present_resids)
+                                chain_renumbered_resids = np.arange(1, len(chain_rmsf) + 1)
+
+                                chain_result = {
+                                    'rmsf': chain_rmsf,
+                                    'resids': chain_renumbered_resids,
+                                    'chain_id': chain_id,
+                                    'original_resids': chain_original_resids
+                                }
+
+                                chain_pickle = _pkl(f'{analysis_file_prefix[analysis]}_{system}_{variation}_rep{rep}_chain{chain_id}.pkl')
+                                with open(chain_pickle, 'wb') as f:
+                                    pickle.dump(chain_result, f)
+                                print(f"  Saved chain {chain_id} RMSF ({len(chain_rmsf)} residues) to {chain_pickle}")
+                        else:
+                            # No chain split — still convert to per-residue RMSF
+                            unique_resids = sorted(set(atom_resids))
+                            full_rmsf, full_resids = _per_residue_rmsf(unique_resids)
+
+                            rmsf_result = {
+                                'rmsf': full_rmsf,
+                                'resids': full_resids,
+                                'chain_id': '',
+                                'original_resids': full_resids,
+                            }
+
+                            pkl_path = _pkl(f'{analysis_file_prefix[analysis]}_{system}_{variation}_rep{rep}.pkl')
+                            with open(pkl_path, 'wb') as f:
+                                pickle.dump(rmsf_result, f)
+                            print(f"  Saved RMSF ({len(full_rmsf)} residues) to {pkl_path}")
 
                     elif analysis == '2D-RMSD':
                         print("Calculating 2D-RMSD...")
                         matrix_2d_rmsd = diffusionmap.DistanceMatrix(u, select=target_selection).run()
 
-                        with open(f'{analysis_file_prefix[analysis]}_{system}_{variation}_rep{rep}.pkl', 'wb') as f:
-                            pickle.dump(matrix_2d_rmsd, f)
+                        matrix_result = {
+                            'dist_matrix': np.asarray(matrix_2d_rmsd.results.dist_matrix),
+                            'selection': target_selection,
+                        }
+
+                        with open(_pkl(f'{analysis_file_prefix[analysis]}_{system}_{variation}_rep{rep}.pkl'), 'wb') as f:
+                            pickle.dump(matrix_result, f)
 
     print(f"Finished {analysis} calculation for all systems, conditions, and replicates.")
 
@@ -118,6 +449,31 @@ def main():
     parser.add_argument('--group-selections', type=str, nargs='*',
                         help='Additional group selections for RMSD analysis')
 
+    # Chain intervals for RMSF chain split
+    parser.add_argument('--chain-intervals', type=str, default=None,
+                        help='JSON string or file path with chain intervals dict for RMSF chain split. '
+                             'Maps chain ID to [start_resid, end_resid] (1-based PDB-style). '
+                             'Example: \'{"A": [1, 120], "B": [121, 239]}\'')
+
+    # DCD time-axis correction parameters
+    parser.add_argument('--time-interval-between-frames', type=float, default=None,
+                        help='Time interval between frames in picoseconds (for DCD time-axis correction)')
+    parser.add_argument('--time-unit', type=str, default='ns', choices=list(SUPPORTED_TIME_UNITS),
+                        help='Output time unit for corrected time axis (default: ns)')
+
+    # PBC wrapping control
+    parser.add_argument('--wrap-selection', type=str, default='auto',
+                        help='PBC wrap selection: "auto" (wrap non-protein), "none" (disable), '
+                             'or a custom MDAnalysis selection string (default: auto)')
+
+    # Parallelization
+    parser.add_argument('--parallel-backend', type=str, default='serial',
+                        choices=['serial', 'multiprocessing', 'dask'],
+                        help='MDAnalysis parallel backend (default: serial). '
+                             'Only RMSD supports non-serial backends.')
+    parser.add_argument('--n-workers', type=int, default=None,
+                        help='Number of parallel workers (default: auto-detect)')
+
     args = parser.parse_args()
 
     # Parse systems and variations from JSON
@@ -137,6 +493,19 @@ def main():
         print(f"Error parsing JSON: {e}")
         return 1
 
+    # Parse chain_intervals if provided
+    chain_intervals = None
+    if args.chain_intervals is not None:
+        try:
+            if os.path.isfile(args.chain_intervals):
+                with open(args.chain_intervals, 'r', encoding='utf-8') as f:
+                    chain_intervals = json.load(f)
+            else:
+                chain_intervals = json.loads(args.chain_intervals)
+        except (json.JSONDecodeError, FileNotFoundError) as e:
+            print(f"Error parsing chain_intervals JSON: {e}")
+            return 1
+
     # Run the analysis
     run_rms_analysis(
         systems=systems,
@@ -147,7 +516,14 @@ def main():
         ref_selection=args.ref_selection,
         start_frame=args.start_frame,
         traj_format=args.traj_format,
-        group_selections=args.group_selections
+        top_format=args.top_format,
+        group_selections=args.group_selections,
+        chain_intervals=chain_intervals,
+        time_interval_between_frames=args.time_interval_between_frames,
+        time_unit=args.time_unit,
+        wrap_selection=None if args.wrap_selection.lower() == 'none' else args.wrap_selection,
+        parallel_backend=args.parallel_backend,
+        n_workers=args.n_workers,
     )
 
     return 0

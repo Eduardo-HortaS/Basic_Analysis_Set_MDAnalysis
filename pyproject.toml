@@ -1,0 +1,90 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "basic-analysis-set-mdanalysis"
+version = "1.0.0"
+description = "A toolkit for standard MD trajectory analyses using MDAnalysis"
+readme = "README.md"
+license = "GPL-3.0-or-later"
+requires-python = ">=3.10"
+authors = [
+    { name = "Eduardo Horta" },
+]
+keywords = ["molecular-dynamics", "MDAnalysis", "RMSD", "RMSF", "trajectory-analysis"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: GNU General Public License v3 or later (GPLv3+)",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Bio-Informatics",
+    "Topic :: Scientific/Engineering :: Chemistry",
+]
+
+dependencies = [
+    "MDAnalysis>=2.8.0",
+    "numpy",
+    "matplotlib",
+    "scipy",
+]
+
+[project.optional-dependencies]
+parallel = [
+    "dask[distributed]",
+]
+dev = [
+    "pytest",
+    "pytest-html",
+    "pytest-cov",
+]
+
+[project.scripts]
+md-executor = "executor:main"
+md-rmsd = "run_rms_analysis:main"
+md-rog = "run_rog_analysis:main"
+md-hbonds = "run_hbonds_analysis:main"
+
+[project.urls]
+Repository = "https://github.com/Eduardo-HortaS/Basic_Analysis_Set_MDAnalysis"
+
+# ─── Tool configurations ─────────────────────────────────────────────────────
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "integration: marks tests as integration tests requiring real trajectory data (deselect with '-m \"not integration\"')",
+    "nextflow: marks tests that require Nextflow installed and .test_data/ present (run with '-m nextflow')",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = [
+    "executor.py",
+    "run_rms_analysis.py",
+    "run_rog_analysis.py",
+    "run_hbonds_analysis.py",
+    "utils.py",
+    "parallelization.py",
+    "plotting",
+]
+# Flat layout — all modules live at the repo root.
+# Hatch will include *.py files matched above plus the plotting/ package.
+
+[tool.hatch.build.targets.sdist]
+include = [
+    "*.py",
+    "plotting/",
+    "tests/",
+    "conf/",
+    "docs/",
+    "main.nf",
+    "nextflow.config",
+    "requirements.txt",
+    "LICENSE",
+    "README.md",
+    "pyproject.toml",
+    ".python-version",
+]

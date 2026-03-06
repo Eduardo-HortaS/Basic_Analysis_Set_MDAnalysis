@@ -1,10 +1,30 @@
 import os
+import sys
 import pickle
 import argparse
 import json
 import MDAnalysis as mda
 import numpy as np
-from utils import transform_trajectory
+from utils import transform_trajectory, build_complex_selection, convert_time_from_ps, validate_time_unit, SUPPORTED_TIME_UNITS
+
+# Make the module importable under its own name even when run as ``__main__``.
+# This is required so that ``pickle`` can resolve ``RoGResults`` when the script
+# is executed directly (e.g. by Nextflow).
+sys.modules.setdefault('run_rog_analysis', sys.modules[__name__])
+
+
+class RoGResults:
+    """Container for Radius of Gyration results, compatible with plotting functions."""
+
+    def __init__(self, frames, times, rog_values):
+        self.rog_data = np.column_stack((frames, times, rog_values))
+
+
+# Force the canonical module name so that pickle always stores
+# ``run_rog_analysis.RoGResults`` regardless of whether this file is
+# executed as ``__main__`` (Nextflow) or imported as a library (executor.py).
+RoGResults.__module__ = 'run_rog_analysis'
+
 
 # Example selection strings for Radius of Gyration analysis:
 #
@@ -13,10 +33,29 @@ from utils import transform_trajectory
 #   selection = 'protein'              # All protein atoms
 #   selection = 'nucleic'              # All nucleic acid atoms
 
-def run_rog_analysis(systems, variations, num_replicates, start_frame, traj_format, selection='protein and backbone'):
+def run_rog_analysis(systems, variations, num_replicates, start_frame, traj_format, top_format='top', selection='protein and backbone', time_unit='ns', wrap_selection='auto', output_dir=None):
     """
     Runs the Radius of Gyration analysis for each system and variation and saves results as individual pickle files.
+
+    RoG is always serial — it uses a manual per-frame loop rather than an
+    ``AnalysisBase`` subclass, so MDAnalysis parallel backends do not apply.
+
+    Parameters
+    ----------
+    time_unit : str, optional
+        Output time unit: 'fs', 'ps', 'ns', 'us', 'ms', or 's'.  Default: 'ns'.
+    wrap_selection : str or None, optional
+        Controls PBC wrapping.  ``'auto'`` (default) unwraps/centres on
+        protein and wraps everything else.  ``None`` disables wrapping.
+        Any other string is an MDAnalysis selection for atoms to wrap.
+    output_dir : str or None, optional
+        Directory for pickle output.  When *None* (default), pickles are
+        written to the current working directory.
     """
+    validate_time_unit(time_unit)
+    if output_dir:
+        os.makedirs(output_dir, exist_ok=True)
+    _pkl = (lambda name: os.path.join(output_dir, name)) if output_dir else (lambda name: name)
     print("--- Starting Radius of Gyration calculation for each system and variation... ---")
     analysis = 'RoG'
 
@@ -26,22 +65,23 @@ def run_rog_analysis(systems, variations, num_replicates, start_frame, traj_form
     for system in systems:
         for variation in variations[system]:
             for rep in reps:
-                pickle_file = f'{analysis_file_prefix}_{system}_{variation}_rep{rep}.pkl'
+                pickle_file = _pkl(f'{analysis_file_prefix}_{system}_{variation}_rep{rep}.pkl')
                 if os.path.exists(pickle_file):
                     print(f"Skipping {analysis} for {system}, {variation}, replicate {rep} because the data already exists in {pickle_file}.")
                     continue
 
                 print(f"Processing {system}, {variation}, replicate {rep}.")
                 traj_file = f'{system}/{variation}/{system}_production_{variation}_rep_{rep}.{traj_format}'
-                top_file = f'{system}/{variation}/{system}_system_{variation}.top'
+                top_file = f'{system}/{variation}/{system}_system_{variation}.{top_format}'
 
                 u = mda.Universe(top_file, traj_file)
 
-                # Transform trajectory
-                protein = u.select_atoms('protein')
-                not_protein = u.select_atoms('not protein')
-
-                transform_trajectory(u, protein, not_protein)
+                # PBC handling: wrap_selection controls which atoms
+                # are wrapped back into the primary image.
+                complex_ag, ligand_ag, rest_ag = build_complex_selection(u, wrap_selection=wrap_selection)
+                if complex_ag is not None:
+                    transform_trajectory(u, complex_ag, rest_ag,
+                                         ligand_selection=ligand_ag)
 
                 # Select atoms for RoG calculation
                 selected_atoms = u.select_atoms(selection)
@@ -58,18 +98,18 @@ def run_rog_analysis(systems, variations, num_replicates, start_frame, traj_form
                     rog_value = selected_atoms.radius_of_gyration()
                     rog_results.append(rog_value)
                     frames.append(ts.frame)
-                    times.append(ts.time / 1000.0)  # Convert ps to ns
-
-                # Create results object compatible with plotting functions
-                class RoGResults:
-                    def __init__(self, frames, times, rog_values):
-                        # Create structure similar to RMSD results
-                        self.rog_data = np.column_stack((frames, times, rog_values))
+                    times.append(convert_time_from_ps(ts.time, time_unit))
 
                 rog_analysis_results = RoGResults(frames, times, rog_results)
 
-                with open(f'{analysis_file_prefix}_{system}_{variation}_rep{rep}.pkl', 'wb') as f:
-                    pickle.dump(rog_analysis_results, f)
+                rog_result = {
+                    'rog_obj': rog_analysis_results,
+                    'time_unit': time_unit,
+                    'selection': selection,
+                }
+
+                with open(pickle_file, 'wb') as f:
+                    pickle.dump(rog_result, f)
 
     print("Finished Radius of Gyration calculation for all systems and variations.")
 
@@ -93,6 +133,13 @@ def main():
 
     parser.add_argument('--selection', type=str, default='protein and backbone',
                         help='MDAnalysis selection string for atoms to calculate RoG (default: "protein and backbone")')
+    parser.add_argument('--time-unit', type=str, default='ns', choices=list(SUPPORTED_TIME_UNITS),
+                        help='Output time unit (default: ns)')
+
+    # PBC wrapping control
+    parser.add_argument('--wrap-selection', type=str, default='auto',
+                        help='PBC wrap selection: "auto" (wrap non-protein), "none" (disable), '
+                             'or a custom MDAnalysis selection string (default: auto)')
 
     args = parser.parse_args()
 
@@ -120,7 +167,10 @@ def main():
         num_replicates=args.num_replicates,
         start_frame=args.start_frame,
         traj_format=args.traj_format,
-        selection=args.selection
+        top_format=args.top_format,
+        selection=args.selection,
+        time_unit=args.time_unit,
+        wrap_selection=None if args.wrap_selection.lower() == 'none' else args.wrap_selection,
     )
 
     return 0
