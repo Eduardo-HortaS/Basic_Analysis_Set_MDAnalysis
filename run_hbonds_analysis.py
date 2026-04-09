@@ -5,7 +5,8 @@ import json
 import numpy as np
 import MDAnalysis as mda
 from MDAnalysis.analysis import hydrogenbonds
-from utils import transform_trajectory, build_complex_selection
+from MDAnalysis.exceptions import NoDataError
+from utils import transform_trajectory, build_complex_selection, resolve_trajectory_file
 from parallelization import ParallelConfig, get_run_kwargs, safe_run
 
 
@@ -66,7 +67,7 @@ def _build_hbonds_payload(hbonds, *, d_a_cutoff, d_h_a_angle_cutoff,
 #   d_a_cutoff = 3.5         # Distance cutoff between donor and acceptor
 #   d_h_a_angle_cutoff = 150 # Angle cutoff for hydrogen bond
 
-def run_hbonds_analysis(systems, variations, num_replicates, d_a_cutoff, d_h_a_angle_cutoff, start_frame, traj_format, top_format='top', acceptors_sel=None, hydrogens_sel=None, between_pairs=None, update_selections=True, wrap_selection='auto', output_dir=None, parallel_backend='serial', n_workers=None):
+def run_hbonds_analysis(systems, variations, num_replicates, d_a_cutoff, d_h_a_angle_cutoff, start_frame, traj_format, top_format='top', acceptors_sel=None, hydrogens_sel=None, between_pairs=None, update_selections=True, wrap_selection='auto', output_dir=None, parallel_backend='serial', n_workers=None, strict_wrapping=False):
     """
     Runs the Hydrogen Bonds analysis for each system and variation and saves results as individual pickle files.
 
@@ -106,7 +107,9 @@ def run_hbonds_analysis(systems, variations, num_replicates, d_a_cutoff, d_h_a_a
                     continue
 
                 print(f"Processing {system}, {variation}, replicate {rep}.")
-                traj_file = f'{system}/{variation}/{system}_production_{variation}_rep_{rep}.{traj_format}'
+                traj_file, _ = resolve_trajectory_file(
+                    system, variation, rep, traj_format
+                )
                 top_file = f'{system}/{variation}/{system}_system_{variation}.{top_format}'
                 u = mda.Universe(top_file, traj_file)
 
@@ -114,24 +117,48 @@ def run_hbonds_analysis(systems, variations, num_replicates, d_a_cutoff, d_h_a_a
                 # are wrapped back into the primary image.
                 complex_ag, ligand_ag, rest_ag = build_complex_selection(u, wrap_selection=wrap_selection)
                 if complex_ag is not None:
+                    # Keep wrapping serial and run the H-bond analysis on a
+                    # clean trajectory without attached transformations so that
+                    # parallel backends remain usable.
                     transform_trajectory(u, complex_ag, rest_ag,
-                                         ligand_selection=ligand_ag)
+                                         ligand_selection=ligand_ag,
+                                         strict_wrapping=strict_wrapping)
+
+                    wrapped_traj_file = f'wrapped_{system}_production_{variation}_rep{rep}.{traj_format}'
+                    if not os.path.exists(wrapped_traj_file):
+                        print(f"Creating wrapped trajectory (serial pre-processing): {wrapped_traj_file}")
+                        with mda.Writer(wrapped_traj_file, n_atoms=u.atoms.n_atoms) as writer:
+                            for _ts in u.trajectory:
+                                writer.write(u.atoms)
+
+                    del u
+                    u = mda.Universe(top_file, wrapped_traj_file)
 
                 if acceptors_sel is None and hydrogens_sel is None and between_pairs is None:
-                    raise ValueError("You must provide either acceptors_sel and hydrogens_sel, or between_pairs for Hydrogen Bonds analysis.")
+                    raise ValueError("You must provide --between-pairs and/or --atom-selections for Hydrogen Bonds analysis.")
+
+                if (acceptors_sel is None) != (hydrogens_sel is None):
+                    raise ValueError("--atom-selections requires BOTH acceptors and hydrogens selections.")
 
                 hbonds = None
                 if between_pairs is not None:
-                    hbonds = hydrogenbonds.HydrogenBondAnalysis(
-                        u,
-                        donors_sel=None,
-                        acceptors_sel=None,
-                        hydrogens_sel=None,
-                        between=between_pairs,
-                        d_a_cutoff=d_a_cutoff,
-                        d_h_a_angle_cutoff=d_h_a_angle_cutoff,
-                        update_selections=update_selections
-                    )
+                    try:
+                        hbonds = hydrogenbonds.HydrogenBondAnalysis(
+                            u,
+                            donors_sel=None,
+                            acceptors_sel=acceptors_sel,
+                            hydrogens_sel=hydrogens_sel,
+                            between=between_pairs,
+                            d_a_cutoff=d_a_cutoff,
+                            d_h_a_angle_cutoff=d_h_a_angle_cutoff,
+                            update_selections=update_selections
+                        )
+                    except NoDataError as e:
+                        raise ValueError(
+                            "HydrogenBondAnalysis could not infer charge-based selections from this topology. "
+                            "Provide explicit --atom-selections (acceptors and hydrogens), optionally together with --between-pairs. "
+                            f"Underlying error: {e}"
+                        ) from e
                 elif acceptors_sel is not None and hydrogens_sel is not None:
                     hbonds = hydrogenbonds.HydrogenBondAnalysis(
                         u,
@@ -193,17 +220,18 @@ def main():
     parser.add_argument('--no-update-selections', dest='update_selections', action='store_false',
                         help='Do not update selections over time for better performance')
 
-    # Selection options - either atom-focused or pair-focused
-    selection_group = parser.add_mutually_exclusive_group(required=True)
-    selection_group.add_argument('--atom-selections', nargs=2, metavar=('ACCEPTORS', 'HYDROGENS'),
-                                help='Atom-focused analysis: acceptors_sel and hydrogens_sel')
-    selection_group.add_argument('--between-pairs', type=str,
-                                help='JSON string for pair-focused analysis: list of [donor, acceptor] pairs')
+    # Selection options. --between-pairs and --atom-selections can be combined.
+    parser.add_argument('--atom-selections', nargs=2, metavar=('ACCEPTORS', 'HYDROGENS'),
+                        help='Explicit atom selections: acceptors_sel and hydrogens_sel')
+    parser.add_argument('--between-pairs', type=str,
+                        help='JSON string for pair-focused analysis: list of [selection1, selection2] pairs')
 
     # PBC wrapping control
     parser.add_argument('--wrap-selection', type=str, default='auto',
                         help='PBC wrap selection: "auto" (wrap non-protein), "none" (disable), '
                              'or a custom MDAnalysis selection string (default: auto)')
+    parser.add_argument('--strict-wrapping', action='store_true',
+                        help='Fail if fragment-aware wrapping cannot be applied')
 
     # Parallelization
     parser.add_argument('--parallel-backend', type=str, default='serial',
@@ -242,8 +270,13 @@ def main():
         except json.JSONDecodeError as e:
             print(f"Error parsing between_pairs JSON: {e}")
             return 1
-    else:
+
+    if args.atom_selections:
         acceptors_sel, hydrogens_sel = args.atom_selections
+
+    if between_pairs is None and args.atom_selections is None:
+        print("Error: You must provide --between-pairs and/or --atom-selections.")
+        return 1
 
     # Run the analysis
     run_hbonds_analysis(
@@ -262,6 +295,7 @@ def main():
         wrap_selection=None if args.wrap_selection.lower() == 'none' else args.wrap_selection,
         parallel_backend=args.parallel_backend,
         n_workers=args.n_workers,
+        strict_wrapping=args.strict_wrapping,
     )
 
     return 0

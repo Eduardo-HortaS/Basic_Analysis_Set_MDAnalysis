@@ -1,18 +1,7 @@
 """
 Shared plotting style constants and helper functions.
-
-Inspired by the professional styling in paulus_plot_rmsd.py:
-  - Curated accessible color palette (expanded beyond 4 to support more series)
-  - Spine removal (top/right) for cleaner look
-  - Light grid with dashed lines
-  - Subtle background facecolor (#f7f7fa)
-  - High-DPI output (400 dpi default)
-  - Mean value overlays as dashed horizontal lines
-  - Legend labels with embedded statistics (mean +/- std)
 """
-import itertools
-
-# Accessible color palette — first 4 from Paulus, extended with additional distinguishable colors
+# Accessible color palette (first 4 preserved from the original project palette).
 DEFAULT_COLORS = [
     '#0072B2',  # blue
     '#009E73',  # green
@@ -41,7 +30,7 @@ def get_color_cycle(n=None):
 
 def apply_style(ax, remove_spines=None):
     """
-    Applies the shared professional style to a matplotlib Axes object.
+    Apply shared style settings to a matplotlib Axes object.
 
     Parameters
     ----------

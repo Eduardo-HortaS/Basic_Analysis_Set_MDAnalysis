@@ -5,7 +5,7 @@ import argparse
 import json
 import MDAnalysis as mda
 import numpy as np
-from utils import transform_trajectory, build_complex_selection, convert_time_from_ps, validate_time_unit, SUPPORTED_TIME_UNITS
+from utils import transform_trajectory, build_complex_selection, convert_time_from_ps, validate_time_unit, SUPPORTED_TIME_UNITS, resolve_trajectory_file
 
 # Make the module importable under its own name even when run as ``__main__``.
 # This is required so that ``pickle`` can resolve ``RoGResults`` when the script
@@ -33,7 +33,7 @@ RoGResults.__module__ = 'run_rog_analysis'
 #   selection = 'protein'              # All protein atoms
 #   selection = 'nucleic'              # All nucleic acid atoms
 
-def run_rog_analysis(systems, variations, num_replicates, start_frame, traj_format, top_format='top', selection='protein and backbone', time_unit='ns', wrap_selection='auto', output_dir=None):
+def run_rog_analysis(systems, variations, num_replicates, start_frame, traj_format, top_format='top', selection='protein and backbone', time_unit='ns', wrap_selection='auto', output_dir=None, strict_wrapping=False):
     """
     Runs the Radius of Gyration analysis for each system and variation and saves results as individual pickle files.
 
@@ -71,7 +71,9 @@ def run_rog_analysis(systems, variations, num_replicates, start_frame, traj_form
                     continue
 
                 print(f"Processing {system}, {variation}, replicate {rep}.")
-                traj_file = f'{system}/{variation}/{system}_production_{variation}_rep_{rep}.{traj_format}'
+                traj_file, _ = resolve_trajectory_file(
+                    system, variation, rep, traj_format
+                )
                 top_file = f'{system}/{variation}/{system}_system_{variation}.{top_format}'
 
                 u = mda.Universe(top_file, traj_file)
@@ -81,7 +83,8 @@ def run_rog_analysis(systems, variations, num_replicates, start_frame, traj_form
                 complex_ag, ligand_ag, rest_ag = build_complex_selection(u, wrap_selection=wrap_selection)
                 if complex_ag is not None:
                     transform_trajectory(u, complex_ag, rest_ag,
-                                         ligand_selection=ligand_ag)
+                                         ligand_selection=ligand_ag,
+                                         strict_wrapping=strict_wrapping)
 
                 # Select atoms for RoG calculation
                 selected_atoms = u.select_atoms(selection)
@@ -140,6 +143,8 @@ def main():
     parser.add_argument('--wrap-selection', type=str, default='auto',
                         help='PBC wrap selection: "auto" (wrap non-protein), "none" (disable), '
                              'or a custom MDAnalysis selection string (default: auto)')
+    parser.add_argument('--strict-wrapping', action='store_true',
+                        help='Fail if fragment-aware wrapping cannot be applied')
 
     args = parser.parse_args()
 
@@ -171,6 +176,7 @@ def main():
         selection=args.selection,
         time_unit=args.time_unit,
         wrap_selection=None if args.wrap_selection.lower() == 'none' else args.wrap_selection,
+        strict_wrapping=args.strict_wrapping,
     )
 
     return 0

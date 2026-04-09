@@ -30,6 +30,9 @@ dependencies = [
     "numpy",
     "matplotlib",
     "scipy",
+    "pytest>=9.0.2",
+    "pytest-cov>=7.0.0",
+    "pytest-html>=4.2.0",
 ]
 
 [project.optional-dependencies]

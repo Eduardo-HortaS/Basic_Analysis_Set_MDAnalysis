@@ -9,6 +9,7 @@ Nextflow pipeline for batch execution.
 
 - **RMSD** with DCD time-axis correction and KDE density sideplot
 - **RMSF** with per-chain splitting and 1-based PDB-style residue validation
+- **Named comparison plot groups** for RMSD/RMSF (`[plot_groups]`, `replicate_mode = separate|average`)
 - **2D-RMSD** pairwise distance matrix heatmaps
 - **Radius of Gyration** over time with KDE density sideplot
 - **Hydrogen Bonds** — count by time, type, and specific atom IDs
@@ -76,6 +77,7 @@ The scripts expect trajectory data organized as:
 │   ├── plot_2d_rmsd.py      # 2D-RMSD heatmap
 │   ├── plot_rog.py          # RoG + KDE plot
 │   └── plot_hbonds.py       # H-bond plots (by time/type/IDs)
+├── plot_group_comparisons.py # Grouped RMSD/RMSF comparison plotting helper
 ├── ini_to_nf_params.py      # INI → Nextflow YAML converter
 ├── compare_outputs.py       # Semantic pickle comparison (Python vs Nextflow)
 ├── compare_parallel_serial.py  # Parallel vs serial result comparison
@@ -125,6 +127,9 @@ nextflow run main.nf -profile test,local16
 uv run python ini_to_nf_params.py my_config.ini -o params.yml
 nextflow run main.nf -params-file params.yml
 
+# Grouped comparison plotting (RMSD/RMSF only) is propagated from INI
+# [plot_groups] into Nextflow params via ini_to_nf_params.py
+
 # With MDAnalysis-level parallelization (RMSD + H-bonds)
 nextflow run main.nf -profile test \
   --parallel_backend multiprocessing --n_workers 4
@@ -139,6 +144,27 @@ nextflow run main.nf -profile test,local16
 > parallelises each (system, variation, replicate) independently.
 
 See [docs/ANALYZING_PROTOCOL.md](docs/ANALYZING_PROTOCOL.md) for full usage examples.
+
+## Plot Groups (RMSD/RMSF)
+
+Named comparison plot groups let you overlay systems/variations in shared plots.
+This is supported in both `executor.py` and the Nextflow pipeline.
+
+Scope and behavior:
+- Supported analyses: RMSD and RMSF only.
+- Unsupported grouped comparisons: 2D-RMSD, RoG, H-bonds.
+- `replicate_mode = separate` creates one comparison plot per replicate.
+- `replicate_mode = average` averages replicates before plotting.
+- Missing member pickles are warned and skipped (run continues).
+
+Example INI section:
+
+```ini
+[plot_groups]
+replicate_mode = separate
+Ung_GC_vs_TA = [["Ung_G-C_4", "wild"], ["Ung_T-A_4", "wild"]]
+Ung_GC_vs_UG = [["Ung_G-C_4", "wild"], ["Ung_U-G", "mut"]]
+```
 
 ## Parallelization (MDAnalysis 2.8+)
 

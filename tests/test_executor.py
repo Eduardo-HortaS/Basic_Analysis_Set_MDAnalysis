@@ -359,6 +359,33 @@ class TestPlotGroupsParsing:
         cfg = load_config(str(ini))
         assert cfg['replicate_mode'] == 'average'
 
+    def test_plot_groups_invalid_replicate_mode_falls_back(self, tmp_path):
+        """Invalid replicate_mode should warn and fall back to 'separate'."""
+        ini = tmp_path / "test.ini"
+        content = (
+            "[systems]\n"
+            "systems = [\"SysA\"]\n"
+            "variations = {\"SysA\": [\"v1\"]}\n"
+            "num_replicates = 1\n"
+            "\n"
+            "[paths]\n"
+            f"input_dir = {tmp_path}\n"
+            f"output_dir = {tmp_path / 'results'}\n"
+            "\n"
+            "[analysis]\n"
+            "run_rmsd = true\n"
+            "\n"
+            "[rmsd]\n"
+            "time_interval_between_frames = 2.0\n"
+            "\n"
+            "[plot_groups]\n"
+            "replicate_mode = invalid_mode\n"
+            'grp1 = [["SysA", "v1"]]\n'
+        )
+        ini.write_text(content)
+        cfg = load_config(str(ini))
+        assert cfg['replicate_mode'] == 'separate'
+
     def test_no_plot_groups_section_gives_empty_dict(self, tmp_path):
         """Without [plot_groups], cfg['plot_groups'] should be empty dict."""
         ini = _write_ini(tmp_path, "run_rmsd = true")

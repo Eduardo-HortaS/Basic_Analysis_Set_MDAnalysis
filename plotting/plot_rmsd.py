@@ -2,8 +2,7 @@
 RMSD plotting script.
 
 Generates RMSD vs Time plots with an optional KDE density sideplot.
-Inspired by paulus_plot_rmsd.py: dual-panel GridSpec layout, mean overlay lines,
-legend with statistics, and professional styling.
+Includes dual-panel GridSpec layout, mean overlay lines, and legend statistics.
 
 Reads pickle files produced by run_rms_analysis.py (RMSD mode).
 """
@@ -346,8 +345,8 @@ def main():
     """Main function to parse arguments and generate RMSD plots."""
     parser = argparse.ArgumentParser(description='Generate RMSD plots from pickle files')
 
-    parser.add_argument('--pickle-file', type=str, required=True,
-                        help='Path to the RMSD pickle file')
+    parser.add_argument('--pickle-file', type=str, nargs='+', required=True,
+                        help='One or more RMSD pickle files')
     parser.add_argument('--output-dir', type=str, default='.',
                         help='Directory to save plots (default: current directory)')
     parser.add_argument('--dpi', type=int, default=DEFAULT_DPI,
@@ -359,16 +358,40 @@ def main():
 
     args = parser.parse_args()
 
-    if not os.path.exists(args.pickle_file):
-        print(f"Error: Pickle file not found: {args.pickle_file}")
+    missing = [p for p in args.pickle_file if not os.path.exists(p)]
+    if missing:
+        for p in missing:
+            print(f"Error: Pickle file not found: {p}")
         return 1
 
-    plot_rmsd(
-        pickle_file=args.pickle_file,
+    # Backward-compatible single-file mode.
+    if len(args.pickle_file) == 1:
+        plot_rmsd(
+            pickle_file=args.pickle_file[0],
+            output_dir=args.output_dir,
+            dpi=args.dpi,
+            show_kde=not args.no_kde,
+            label=args.label
+        )
+        return 0
+
+    # Multi-file mode: overlay files in one comparison plot.
+    pickle_files = args.pickle_file
+    labels = [os.path.splitext(os.path.basename(p))[0].replace('rmsd_plot_', '') for p in pickle_files]
+    first_name = os.path.splitext(os.path.basename(pickle_files[0]))[0]
+    group_name = first_name.replace('rmsd_plot_', '').split('_sel')[0]
+
+    if args.label:
+        print("Warning: --label is ignored when multiple --pickle-file values are provided")
+
+    plot_rmsd_comparison(
+        pickle_files=pickle_files,
+        labels=labels,
+        group_name=group_name,
         output_dir=args.output_dir,
         dpi=args.dpi,
         show_kde=not args.no_kde,
-        label=args.label
+        selection_label=None
     )
 
     return 0

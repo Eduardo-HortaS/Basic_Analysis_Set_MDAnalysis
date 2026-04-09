@@ -440,3 +440,53 @@ class TestPlotRMSFComparison:
         pngs = [f for f in os.listdir(output_dir) if f.endswith('.png')]
         assert len(pngs) == 1
         assert 'average' in pngs[0].lower() or 'avg' in pngs[0].lower()
+
+
+# ─── Grouped Comparison Helper Tests ───────────────────────────────────────
+
+class TestPlotGroupComparisonsHelper:
+    """Tests for plot_group_comparisons.py helper used by Nextflow."""
+
+    def test_rmsd_group_helper_separate_mode(self, mock_rmsd_replicate_groups, tmp_path):
+        """RMSD helper should generate one comparison plot per replicate in separate mode."""
+        from plot_group_comparisons import _plot_rmsd_groups
+
+        work_dir = str(tmp_path)
+        output_dir = str(tmp_path / 'out_rmsd')
+        groups = {'grp_test': [('sysA', 'wild'), ('sysB', 'wild')]}
+
+        produced = _plot_rmsd_groups(
+            groups,
+            work_dir=work_dir,
+            output_dir=output_dir,
+            num_replicates=2,
+            dpi=72,
+            replicate_mode='separate',
+            rmsd_show_kde=False,
+        )
+
+        assert produced == 2
+        pngs = [f for f in os.listdir(output_dir) if f.endswith('.png')]
+        assert len(pngs) == 2
+
+    def test_rmsf_group_helper_average_mode(self, mock_rmsf_replicate_groups, tmp_path):
+        """RMSF helper should generate one averaged comparison plot in average mode."""
+        from plot_group_comparisons import _plot_rmsf_groups
+
+        work_dir = str(tmp_path)
+        output_dir = str(tmp_path / 'out_rmsf')
+        groups = {'grp_test': [('sysA', 'wild'), ('sysB', 'wild')]}
+
+        produced = _plot_rmsf_groups(
+            groups,
+            work_dir=work_dir,
+            output_dir=output_dir,
+            num_replicates=2,
+            dpi=72,
+            replicate_mode='average',
+            target_selection='protein and backbone',
+        )
+
+        assert produced == 1
+        pngs = [f for f in os.listdir(output_dir) if f.endswith('.png')]
+        assert len(pngs) == 1

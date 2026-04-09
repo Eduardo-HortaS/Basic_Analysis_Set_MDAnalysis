@@ -5,7 +5,7 @@ import json
 import numpy as np
 import MDAnalysis as mda
 from MDAnalysis.analysis import rms, diffusionmap
-from utils import transform_trajectory, align_trajectory, build_complex_selection, convert_time_from_ps, validate_time_unit, SUPPORTED_TIME_UNITS
+from utils import transform_trajectory, align_trajectory, build_complex_selection, convert_time_from_ps, validate_time_unit, SUPPORTED_TIME_UNITS, resolve_trajectory_file
 from parallelization import ParallelConfig, get_run_kwargs, safe_run
 
 # Example selection strings for different RMS* analyses:
@@ -91,7 +91,7 @@ def validate_chain_intervals(universe, chain_intervals, target_selection):
 def run_rms_analysis(systems, variations, num_replicates, analysis, target_selection, ref_selection,
                      start_frame, traj_format, top_format='top', group_selections=None, chain_intervals=None,
                      time_interval_between_frames=None, time_unit='ns', ref_suffix='', wrap_selection='auto',
-                     output_dir=None, parallel_backend='serial', n_workers=None):
+                     output_dir=None, parallel_backend='serial', n_workers=None, strict_wrapping=False):
     """
     After external transforming and aligning of trajectory data for each analysis, system, variation and replicate,
     runs the respective analysis (RMSD (2D and conventional) | RMSF) and saves results as individual pickle files.
@@ -203,7 +203,9 @@ def run_rms_analysis(systems, variations, num_replicates, analysis, target_selec
                         continue
 
                 print(f"Processing {system}, {variation}, replicate {rep}.")
-                traj_file = f'{system}/{variation}/{system}_production_{variation}_rep_{rep}.{traj_format}'
+                traj_file, _ = resolve_trajectory_file(
+                    system, variation, rep, traj_format
+                )
                 aligned_traj_file = f'rmsfit_{system}_production_{variation}_reduced_rep{rep}.{traj_format}'
                 top_file = f'{system}/{variation}/{system}_system_{variation}.{top_format}'
 
@@ -217,24 +219,41 @@ def run_rms_analysis(systems, variations, num_replicates, analysis, target_selec
                     complex_ag, ligand_ag, rest_ag = build_complex_selection(
                         u, wrap_selection=wrap_selection)
                     if complex_ag is not None:
+                        # Keep wrapping as a serial pre-processing step and
+                        # run RMSD on a clean trajectory (no attached
+                        # transformations), so MDAnalysis parallel backends can
+                        # be used safely.
                         transform_trajectory(u, complex_ag, rest_ag,
                                              ligand_selection=ligand_ag)
 
-                    # Build list of selections to run independently.
-                    # When group_selections is provided, each entry produces
-                    # a separate RMSD calculation and pickle file.
-                    # When group_selections is None/empty, use target_selection.
+                        wrapped_traj_file = f'wrapped_{system}_production_{variation}_rep{rep}.{traj_format}'
+                        if not os.path.exists(wrapped_traj_file):
+                            print(f"Creating wrapped trajectory (serial pre-processing): {wrapped_traj_file}")
+                            with mda.Writer(wrapped_traj_file, n_atoms=u.atoms.n_atoms) as writer:
+                                for _ts in u.trajectory:
+                                    writer.write(u.atoms)
+
+                        del u
+                        u = mda.Universe(top_file, wrapped_traj_file)
+
+                    # Build selection list with target_selection always first.
+                    # This guarantees the canonical base pickle
+                    # rmsd_plot_*_repX.pkl is always produced for Nextflow,
+                    # while optional group selections are emitted as extras.
+                    rmsd_selections = [target_selection]
                     if group_selections:
-                        rmsd_selections = list(group_selections)
-                    else:
-                        rmsd_selections = [target_selection]
+                        for gs in group_selections:
+                            if gs != target_selection:
+                                rmsd_selections.append(gs)
 
                     for sel_idx, sel_string in enumerate(rmsd_selections):
-                        # Determine pickle filename
-                        if len(rmsd_selections) > 1:
-                            pkl_name = _pkl(f'{analysis_file_prefix[analysis]}_{system}_{variation}_rep{rep}{ref_suffix}_sel{sel_idx}.pkl')
-                        else:
+                        # Determine pickle filename.
+                        # sel_idx == 0 corresponds to target_selection and writes
+                        # the canonical base file expected by pipeline processes.
+                        if sel_idx == 0:
                             pkl_name = _pkl(f'{analysis_file_prefix[analysis]}_{system}_{variation}_rep{rep}{ref_suffix}.pkl')
+                        else:
+                            pkl_name = _pkl(f'{analysis_file_prefix[analysis]}_{system}_{variation}_rep{rep}{ref_suffix}_sel{sel_idx - 1}.pkl')
 
                         if os.path.exists(pkl_name):
                             print(f"Skipping RMSD (selection {sel_idx}: '{sel_string}') for {system}, {variation}, replicate {rep} — pickle already exists.")
@@ -332,7 +351,8 @@ def run_rms_analysis(systems, variations, num_replicates, analysis, target_selec
                             u, wrap_selection=wrap_selection)
                         if pre_complex_ag is not None:
                             transform_trajectory(u, pre_complex_ag, pre_rest_ag,
-                                                 ligand_selection=pre_ligand_ag)
+                                                 ligand_selection=pre_ligand_ag,
+                                                 strict_wrapping=strict_wrapping)
 
                         align_trajectory(u, target_selection, analysis, system, variation, rep, traj_format, start_frame)
                         del u
@@ -344,70 +364,111 @@ def run_rms_analysis(systems, variations, num_replicates, analysis, target_selec
                         u, wrap_selection=wrap_selection)
                     if complex_ag is not None:
                         transform_trajectory(u, complex_ag, rest_ag,
-                                             ligand_selection=ligand_ag)
+                                             ligand_selection=ligand_ag,
+                                             strict_wrapping=strict_wrapping)
 
                     if analysis == 'RMSF':
                         print("Calculating RMSF...")
-                        rmsf_atoms = u.select_atoms(target_selection)
-                        to_run_rmsf = rms.RMSF(rmsf_atoms).run()
 
-                        # rms.RMSF computes per-ATOM fluctuations.  Convert to
-                        # per-RESIDUE by averaging atom RMSF values within each
-                        # residue — this is the standard for publication plots.
-                        rmsf_values_atoms = to_run_rmsf.results.rmsf
-                        atom_resids = np.array([atom.resid for atom in rmsf_atoms])
+                        # Build selection list with target_selection always first.
+                        # This guarantees the canonical base pickle is always produced,
+                        # while optional group selections are emitted as extras.
+                        rmsf_selections = [target_selection]
+                        if group_selections:
+                            for gs in group_selections:
+                                if gs != target_selection:
+                                    rmsf_selections.append(gs)
 
-                        def _per_residue_rmsf(resid_list):
-                            """Average atom-level RMSF for each residue in *resid_list*."""
-                            rmsf_list, kept_resids = [], []
-                            for resid in resid_list:
-                                mask = atom_resids == resid
-                                vals = rmsf_values_atoms[mask]
-                                if vals.size == 0:
-                                    continue
-                                rmsf_list.append(np.mean(vals))
-                                kept_resids.append(resid)
-                            return np.array(rmsf_list), np.array(kept_resids)
+                        for sel_idx, sel_string in enumerate(rmsf_selections):
+                            # Determine pickle filename.
+                            # sel_idx == 0 corresponds to target_selection and writes
+                            # the canonical base file expected by pipeline processes.
+                            if sel_idx == 0:
+                                pkl_name_template = f'{analysis_file_prefix[analysis]}_{system}_{variation}_rep{rep}.pkl'
+                            else:
+                                pkl_name_template = f'{analysis_file_prefix[analysis]}_{system}_{variation}_rep{rep}_sel{sel_idx - 1}.pkl'
 
-                        if system_chain_intervals is not None:
-                            # Validate chain intervals against the trajectory
-                            validate_chain_intervals(u, system_chain_intervals, target_selection)
+                            # Validate that the selection exists in the universe
+                            try:
+                                sel_atoms = u.select_atoms(sel_string)
+                            except Exception as e:
+                                print(f"WARNING: Selection '{sel_string}' raised an error for {system}/{variation} rep {rep}: {e} — skipping this selection.")
+                                continue
+                            if len(sel_atoms) == 0:
+                                print(f"WARNING: Selection '{sel_string}' matched 0 atoms in {system}/{variation} rep {rep} — skipping this selection.")
+                                continue
 
-                            # Split RMSF results by chain
-                            for chain_id, (start_resid, end_resid) in system_chain_intervals.items():
-                                present_resids = [r for r in range(start_resid, end_resid + 1)
-                                                  if r in set(atom_resids)]
-                                chain_rmsf, chain_original_resids = _per_residue_rmsf(present_resids)
-                                chain_renumbered_resids = np.arange(1, len(chain_rmsf) + 1)
+                            # Compute RMSF for this selection
+                            rmsf_atoms = sel_atoms
+                            to_run_rmsf = rms.RMSF(rmsf_atoms).run()
 
-                                chain_result = {
-                                    'rmsf': chain_rmsf,
-                                    'resids': chain_renumbered_resids,
-                                    'chain_id': chain_id,
-                                    'original_resids': chain_original_resids
+                            # rms.RMSF computes per-ATOM fluctuations.  Convert to
+                            # per-RESIDUE by averaging atom RMSF values within each
+                            # residue — this is the standard for publication plots.
+                            rmsf_values_atoms = to_run_rmsf.results.rmsf
+                            atom_resids = np.array([atom.resid for atom in rmsf_atoms])
+
+                            def _per_residue_rmsf(resid_list):
+                                """Average atom-level RMSF for each residue in *resid_list*."""
+                                rmsf_list, kept_resids = [], []
+                                for resid in resid_list:
+                                    mask = atom_resids == resid
+                                    vals = rmsf_values_atoms[mask]
+                                    if vals.size == 0:
+                                        continue
+                                    rmsf_list.append(np.mean(vals))
+                                    kept_resids.append(resid)
+                                return np.array(rmsf_list), np.array(kept_resids)
+
+                            # Apply chain-interval splitting only to the canonical
+                            # base selection (sel_idx == 0). For explicit group
+                            # selections (e.g., chain-specific selections), writing
+                            # per-selection RMSF directly avoids interval/selection
+                            # mismatches.
+                            if system_chain_intervals is not None and sel_idx == 0:
+                                # Validate chain intervals against the trajectory
+                                validate_chain_intervals(u, system_chain_intervals, sel_string)
+
+                                # Split RMSF results by chain
+                                for chain_id, (start_resid, end_resid) in system_chain_intervals.items():
+                                    present_resids = [r for r in range(start_resid, end_resid + 1)
+                                                      if r in set(atom_resids)]
+                                    chain_rmsf, chain_original_resids = _per_residue_rmsf(present_resids)
+                                    chain_renumbered_resids = np.arange(1, len(chain_rmsf) + 1)
+
+                                    chain_result = {
+                                        'rmsf': chain_rmsf,
+                                        'resids': chain_renumbered_resids,
+                                        'chain_id': chain_id,
+                                        'original_resids': chain_original_resids,
+                                        'selection': sel_string,
+                                    }
+
+                                    if sel_idx == 0:
+                                        chain_pkl = _pkl(f'{analysis_file_prefix[analysis]}_{system}_{variation}_rep{rep}_chain{chain_id}.pkl')
+                                    else:
+                                        chain_pkl = _pkl(f'{analysis_file_prefix[analysis]}_{system}_{variation}_rep{rep}_sel{sel_idx - 1}_chain{chain_id}.pkl')
+
+                                    with open(chain_pkl, 'wb') as f:
+                                        pickle.dump(chain_result, f)
+                                    print(f"  Saved chain {chain_id} RMSF ({len(chain_rmsf)} residues, sel_idx={sel_idx}) to {chain_pkl}")
+                            else:
+                                # No chain split — still convert to per-residue RMSF
+                                unique_resids = sorted(set(atom_resids))
+                                full_rmsf, full_resids = _per_residue_rmsf(unique_resids)
+
+                                rmsf_result = {
+                                    'rmsf': full_rmsf,
+                                    'resids': full_resids,
+                                    'chain_id': '',
+                                    'original_resids': full_resids,
+                                    'selection': sel_string,
                                 }
 
-                                chain_pickle = _pkl(f'{analysis_file_prefix[analysis]}_{system}_{variation}_rep{rep}_chain{chain_id}.pkl')
-                                with open(chain_pickle, 'wb') as f:
-                                    pickle.dump(chain_result, f)
-                                print(f"  Saved chain {chain_id} RMSF ({len(chain_rmsf)} residues) to {chain_pickle}")
-                        else:
-                            # No chain split — still convert to per-residue RMSF
-                            unique_resids = sorted(set(atom_resids))
-                            full_rmsf, full_resids = _per_residue_rmsf(unique_resids)
-
-                            rmsf_result = {
-                                'rmsf': full_rmsf,
-                                'resids': full_resids,
-                                'chain_id': '',
-                                'original_resids': full_resids,
-                            }
-
-                            pkl_path = _pkl(f'{analysis_file_prefix[analysis]}_{system}_{variation}_rep{rep}.pkl')
-                            with open(pkl_path, 'wb') as f:
-                                pickle.dump(rmsf_result, f)
-                            print(f"  Saved RMSF ({len(full_rmsf)} residues) to {pkl_path}")
-
+                                pkl_path = _pkl(pkl_name_template)
+                                with open(pkl_path, 'wb') as f:
+                                    pickle.dump(rmsf_result, f)
+                                print(f"  Saved RMSF ({len(full_rmsf)} residues, sel_idx={sel_idx}) to {pkl_path}")
                     elif analysis == '2D-RMSD':
                         print("Calculating 2D-RMSD...")
                         matrix_2d_rmsd = diffusionmap.DistanceMatrix(u, select=target_selection).run()
@@ -465,6 +526,8 @@ def main():
     parser.add_argument('--wrap-selection', type=str, default='auto',
                         help='PBC wrap selection: "auto" (wrap non-protein), "none" (disable), '
                              'or a custom MDAnalysis selection string (default: auto)')
+    parser.add_argument('--strict-wrapping', action='store_true',
+                        help='Fail if fragment-aware wrapping cannot be applied')
 
     # Parallelization
     parser.add_argument('--parallel-backend', type=str, default='serial',
@@ -524,6 +587,7 @@ def main():
         wrap_selection=None if args.wrap_selection.lower() == 'none' else args.wrap_selection,
         parallel_backend=args.parallel_backend,
         n_workers=args.n_workers,
+        strict_wrapping=args.strict_wrapping,
     )
 
     return 0

@@ -38,6 +38,9 @@ def _make_cfg(**overrides):
         'between_pairs': None,
         'dpi': 400,
         'hbonds_top_n': 20,
+        'rmsd_show_kde': True,
+        'plot_groups': {},
+        'replicate_mode': 'separate',
     }
     cfg.update(overrides)
     return cfg
@@ -100,6 +103,31 @@ class TestCfgToNfParams:
         cfg = _make_cfg(n_workers=None)
         params = _cfg_to_nf_params(cfg)
         assert 'n_workers' not in params
+
+    def test_plot_groups_mapped_when_non_empty(self):
+        """plot_groups should be serialized only when groups exist."""
+        cfg = _make_cfg(plot_groups={'grp': [('SysA', 'v1'), ('SysB', 'v1')]})
+        params = _cfg_to_nf_params(cfg)
+        assert 'plot_groups' in params
+        assert 'grp' in params['plot_groups']
+
+    def test_plot_groups_omitted_when_empty(self):
+        """Empty plot_groups should not be forwarded to Nextflow params."""
+        cfg = _make_cfg(plot_groups={})
+        params = _cfg_to_nf_params(cfg)
+        assert 'plot_groups' not in params
+
+    def test_replicate_mode_mapped(self):
+        """replicate_mode should always be forwarded with default fallback."""
+        cfg = _make_cfg(replicate_mode='average')
+        params = _cfg_to_nf_params(cfg)
+        assert params['replicate_mode'] == 'average'
+
+    def test_rmsd_show_kde_mapped(self):
+        """rmsd_show_kde should be forwarded for grouped RMSD plotting parity."""
+        cfg = _make_cfg(rmsd_show_kde=False)
+        params = _cfg_to_nf_params(cfg)
+        assert params['rmsd_show_kde'] is False
 
 
 class TestDumpYaml:

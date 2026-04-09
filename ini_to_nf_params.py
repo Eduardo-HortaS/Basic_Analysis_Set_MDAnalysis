@@ -88,6 +88,12 @@ def _cfg_to_nf_params(cfg: dict) -> dict:
     # Plotting  ──────────────────────────────────────────────────────────
     params['dpi'] = cfg['dpi']
     params['hbonds_top_n'] = cfg.get('hbonds_top_n', 20)
+    params['rmsd_show_kde'] = cfg.get('rmsd_show_kde', True)
+
+    # Plot-group comparisons (RMSD/RMSF only)
+    if cfg.get('plot_groups'):
+        params['plot_groups'] = json.dumps(cfg['plot_groups'])
+    params['replicate_mode'] = cfg.get('replicate_mode', 'separate')
 
     # Parallelization  ───────────────────────────────────────────────────
     params['parallel_backend'] = cfg.get('parallel_backend', 'serial')

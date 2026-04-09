@@ -29,7 +29,7 @@ params.traj_format      = 'dcd'
 params.top_format       = 'top'
 params.start_frame      = 0
 params.input_dir        = '.'     // Base directory containing {system}/{variation}/ structure
-params.outdir           = './results'
+params.outdir           = 'results_nf'
 
 // Analysis toggles
 params.run_rmsd         = true
@@ -68,10 +68,16 @@ params.update_selections = true
 
 // PBC wrapping
 params.wrap_selection   = 'auto'   // 'auto', 'none', or an MDAnalysis selection string
+params.strict_wrapping  = false
 
 // Plotting
 params.dpi              = 400
 params.hbonds_top_n     = 20
+params.rmsd_show_kde    = true
+
+// Comparison plot groups (RMSD/RMSF)
+params.plot_groups      = null  // JSON: {"group_name": [["SysA", "wild"], ...]}
+params.replicate_mode   = 'separate'  // 'separate' or 'average'
 
 // Parallelization — MDAnalysis 2.8+ native parallel backends
 // 'serial' (default), 'multiprocessing', or 'dask'
@@ -80,6 +86,8 @@ params.n_workers        = null    // null = auto-detect
 
 // ─── Helper: Resolve script paths ────────────────────────────────────────────
 def scriptDir = "${projectDir}"
+def analysisDirAbs = new File(params.input_dir.toString()).absolutePath
+def outdirAbs = resolve_outdir_abs(params.outdir, analysisDirAbs)
 
 // ─── Input Channel ───────────────────────────────────────────────────────────
 
@@ -103,37 +111,52 @@ workflow {
         .fromList(generate_combinations())
         .set { analysis_inputs }
 
+    def _plot_groups_map = parse_plot_groups(params.plot_groups)
+    def _has_plot_groups = !_plot_groups_map.isEmpty()
+
+    // Wrap each trajectory once and fan out wrapped inputs to all analyses.
+    RUN_WRAP(analysis_inputs)
+    def wrapped_inputs = RUN_WRAP.out.wrapped
+
     // Run analyses conditionally
     if (params.run_rmsd) {
-        RUN_RMSD(analysis_inputs)
+        RUN_RMSD(wrapped_inputs)
+
         if (params.plot_rmsd) {
             PLOT_RMSD(RUN_RMSD.out.pickle)
+            if (_has_plot_groups) {
+                PLOT_RMSD_GROUPS(PLOT_RMSD.out.plot.collect())
+            }
         }
     }
 
     if (params.run_rmsf) {
-        RUN_RMSF(analysis_inputs)
+        RUN_RMSF(wrapped_inputs)
+
         if (params.plot_rmsf) {
             PLOT_RMSF(RUN_RMSF.out.pickle.flatten())
+            if (_has_plot_groups) {
+                PLOT_RMSF_GROUPS(PLOT_RMSF.out.plot.collect())
+            }
         }
     }
 
     if (params.run_2d_rmsd) {
-        RUN_2D_RMSD(analysis_inputs)
+        RUN_2D_RMSD(wrapped_inputs)
         if (params.plot_2d_rmsd) {
             PLOT_2D_RMSD(RUN_2D_RMSD.out.pickle)
         }
     }
 
     if (params.run_rog) {
-        RUN_ROG(analysis_inputs)
+        RUN_ROG(wrapped_inputs)
         if (params.plot_rog) {
             PLOT_ROG(RUN_ROG.out.pickle)
         }
     }
 
     if (params.run_hbonds) {
-        RUN_HBONDS(analysis_inputs)
+        RUN_HBONDS(wrapped_inputs)
         if (params.plot_hbonds) {
             PLOT_HBONDS(RUN_HBONDS.out.pickle)
         }
@@ -142,6 +165,7 @@ workflow {
 
 // ─── Helper function ─────────────────────────────────────────────────────────
 
+import groovy.json.JsonOutput
 import groovy.json.JsonSlurper
 
 def generate_combinations() {
@@ -169,7 +193,7 @@ def generate_combinations() {
     systems.each { system ->
         variations[system].each { variation ->
             (1..params.num_replicates).each { rep ->
-                def traj = file("${params.input_dir}/${system}/${variation}/${system}_production_${variation}_rep_${rep}.${params.traj_format}")
+                def traj = resolve_traj_file(system, variation, rep)
                 def top  = file("${params.input_dir}/${system}/${variation}/${system}_system_${variation}.${params.top_format}")
                 combos.add(tuple(system, variation, rep, top, traj))
             }
@@ -178,30 +202,177 @@ def generate_combinations() {
     return combos
 }
 
+def resolve_traj_file(system, variation, rep) {
+    def withUnderscore = file("${params.input_dir}/${system}/${variation}/${system}_production_${variation}_rep_${rep}.${params.traj_format}")
+    if (withUnderscore.exists()) {
+        return withUnderscore
+    }
+
+    def noUnderscore = file("${params.input_dir}/${system}/${variation}/${system}_production_${variation}_rep${rep}.${params.traj_format}")
+    if (noUnderscore.exists()) {
+        return noUnderscore
+    }
+
+    // Keep legacy path as default so downstream errors show the historical pattern.
+    return withUnderscore
+}
+
+def resolve_outdir_abs(rawOutdir, analysisDirAbs) {
+    def configured = rawOutdir?.toString()?.trim()
+
+    // Keep legacy defaults mapped to a deterministic analysis-local folder.
+    if (!configured || configured in ['results', './results', 'results_nf', './results_nf']) {
+        return new File(analysisDirAbs, 'results_nf').absolutePath
+    }
+
+    def configuredFile = new File(configured)
+    if (configuredFile.isAbsolute()) {
+        return configuredFile.absolutePath
+    }
+
+    // Resolve relative outdir from the analysis input folder, not launchDir.
+    return new File(analysisDirAbs, configured).absolutePath
+}
+
+def parse_plot_groups(rawValue) {
+    if (!rawValue) {
+        return [:]
+    }
+
+    if (rawValue instanceof Map) {
+        return rawValue as Map
+    }
+
+    def jsonSlurper = new JsonSlurper()
+    def value = rawValue.toString()
+    def maybeFile = new File(value)
+
+    def parsed
+    if (maybeFile.exists()) {
+        parsed = jsonSlurper.parse(maybeFile)
+    } else {
+        parsed = jsonSlurper.parseText(value)
+    }
+
+    if (!(parsed instanceof Map)) {
+        error "ERROR: plot_groups must be a JSON object mapping group names to member lists"
+    }
+    return parsed as Map
+}
+
 // ─── Processes ───────────────────────────────────────────────────────────────
 
-process RUN_RMSD {
+process RUN_WRAP {
     tag "${system}_${variation}_rep${rep}"
     label 'process_medium'
-    cpus { params.parallel_backend != 'serial' && params.n_workers ? params.n_workers : (params.parallel_backend != 'serial' ? 4 : 1) }
-    publishDir "${params.outdir}/rmsd", mode: 'copy'
+    cache 'lenient'
+    publishDir "${outdirAbs}/wrapped", mode: 'copy'
 
     input:
     tuple val(system), val(variation), val(rep), path(top_file), path(traj_file)
 
     output:
-    path("rmsd_plot_${system}_${variation}_rep${rep}.pkl"), emit: pickle
+    tuple val(system), val(variation), val(rep), path(top_file), path("wrapped_${system}_production_${variation}_rep${rep}.${params.traj_format}"), emit: wrapped
+
+    script:
+    def wrappedName = "wrapped_${system}_production_${variation}_rep${rep}.${params.traj_format}"
+    """
+    persisted_dir="${outdirAbs}/wrapped"
+    persisted_file="\$persisted_dir/${wrappedName}"
+
+    if [ -s "\$persisted_file" ]; then
+        cp -f "\$persisted_file" "${wrappedName}"
+    else
+        python - "${top_file}" "${traj_file}" "${wrappedName}" "${params.wrap_selection}" "${params.strict_wrapping}" <<'PY'
+import shutil
+import sys
+
+import MDAnalysis as mda
+
+from utils import build_complex_selection, transform_trajectory
+
+top_file, traj_file, wrapped_out, wrap_selection, strict_raw = sys.argv[1:6]
+strict_wrapping = strict_raw.lower() in {'true', '1', 'yes'}
+
+if wrap_selection.lower() == 'none':
+    shutil.copy2(traj_file, wrapped_out)
+    sys.exit(0)
+
+u = mda.Universe(top_file, traj_file)
+complex_ag, ligand_ag, rest_ag = build_complex_selection(u, wrap_selection=wrap_selection)
+
+if complex_ag is None:
+    shutil.copy2(traj_file, wrapped_out)
+else:
+    transform_trajectory(
+        u,
+        complex_ag,
+        rest_ag,
+        ligand_selection=ligand_ag,
+        strict_wrapping=strict_wrapping,
+    )
+    with mda.Writer(wrapped_out, n_atoms=u.atoms.n_atoms) as writer:
+        for _ts in u.trajectory:
+            writer.write(u.atoms)
+PY
+
+        cp -f "${wrappedName}" "\$persisted_file" 2>/dev/null || true
+    fi
+    """
+}
+
+process RUN_RMSD {
+    tag "${system}_${variation}_rep${rep}"
+    label 'process_medium'
+    cpus { params.parallel_backend != 'serial' && params.n_workers ? params.n_workers : (params.parallel_backend != 'serial' ? 4 : 1) }
+    publishDir "${outdirAbs}/rmsd", mode: 'copy'
+    cache 'lenient'
+
+    input:
+    tuple val(system), val(variation), val(rep), path(top_file), path(traj_file)
+
+    output:
+    path("rmsd_plot_${system}_${variation}_rep${rep}*.pkl"), emit: pickle
 
     script:
     def time_arg = params.time_interval_between_frames ? "--time-interval-between-frames ${params.time_interval_between_frames} --time-unit ${params.time_unit}" : ""
-    def group_arg = params.group_selections ? "--group-selections '${params.group_selections}'" : ""
-    def wrap_arg = params.wrap_selection == 'none' ? "--wrap-selection none" : (params.wrap_selection != 'auto' ? "--wrap-selection '${params.wrap_selection}'" : "")
+    def group_selections_list = []
+    if (params.group_selections) {
+        if (params.group_selections instanceof Collection) {
+            group_selections_list = params.group_selections as List
+        } else {
+            def raw = params.group_selections.toString().trim()
+            if (raw.startsWith('[') && raw.endsWith(']')) {
+                try {
+                    group_selections_list = new JsonSlurper().parseText(raw) as List
+                } catch (Exception ignored) {
+                    // Support legacy non-JSON list syntax like:
+                    // [chainid A, chainid B, chainid C]
+                    def inner = raw.substring(1, raw.length() - 1).trim()
+                    if (inner) {
+                        group_selections_list = inner
+                            .split(/\s*,\s*/)
+                            .collect { it.toString().replaceAll(/^['\"]|['\"]$/, '') }
+                            .findAll { it }
+                    }
+                }
+            } else {
+                group_selections_list = [raw]
+            }
+        }
+    }
+    def group_arg = group_selections_list ? "--group-selections ${group_selections_list.collect { "'${it.toString().replace("'", "'\\''")}'" }.join(' ')}" : ""
+    def wrap_arg = "--wrap-selection none"
+    def strict_arg = ""
     def parallel_arg = params.parallel_backend != 'serial' ? "--parallel-backend ${params.parallel_backend}" : ""
     def nworkers_arg = params.n_workers ? "--n-workers ${params.n_workers}" : ""
     """
     mkdir -p ${system}/${variation}
     ln -sf \$(readlink -f ${top_file}) ${system}/${variation}/${system}_system_${variation}.${params.top_format}
-    ln -sf \$(readlink -f ${traj_file}) ${system}/${variation}/${system}_production_${variation}_rep_${rep}.${params.traj_format}
+    ln -sf \$(readlink -f ${traj_file}) ${system}/${variation}/${system}_production_${variation}_rep_1.${params.traj_format}
+    ln -sf \$(readlink -f ${traj_file}) ${system}/${variation}/${system}_production_${variation}_rep1.${params.traj_format}
+
+    cp -f ${outdirAbs}/rmsd/rmsd_plot_${system}_${variation}_rep${rep}*.pkl . 2>/dev/null || true
 
     python ${scriptDir}/run_rms_analysis.py \\
         --systems '["${system}"]' \\
@@ -213,16 +384,22 @@ process RUN_RMSD {
         --start-frame ${params.start_frame} \\
         --traj-format ${params.traj_format} \\
         --top-format ${params.top_format} \\
-        ${time_arg} ${group_arg} ${wrap_arg} ${parallel_arg} ${nworkers_arg}
+        ${time_arg} ${group_arg} ${wrap_arg} ${strict_arg} ${parallel_arg} ${nworkers_arg}
 
-    mv rmsd_plot_${system}_${variation}_rep1.pkl rmsd_plot_${system}_${variation}_rep${rep}.pkl || true
+    for f in rmsd_plot_${system}_${variation}_rep1*.pkl; do
+        if [ -e "\$f" ]; then
+            newname=\$(echo "\$f" | sed "s/rep1/rep${rep}/")
+            [ "\$f" != "\$newname" ] && mv "\$f" "\$newname" || true
+        fi
+    done
     """
 }
 
 process RUN_RMSF {
     tag "${system}_${variation}_rep${rep}"
     label 'process_medium'
-    publishDir "${params.outdir}/rmsf", mode: 'copy'
+    publishDir "${outdirAbs}/rmsf", mode: 'copy'
+    cache 'lenient'
 
     input:
     tuple val(system), val(variation), val(rep), path(top_file), path(traj_file)
@@ -232,11 +409,41 @@ process RUN_RMSF {
 
     script:
     def chain_arg = params.chain_intervals ? "--chain-intervals '${params.chain_intervals}'" : ""
-    def wrap_arg = params.wrap_selection == 'none' ? "--wrap-selection none" : (params.wrap_selection != 'auto' ? "--wrap-selection '${params.wrap_selection}'" : "")
+    def group_selections_list = []
+    if (params.group_selections) {
+        if (params.group_selections instanceof Collection) {
+            group_selections_list = params.group_selections as List
+        } else {
+            def raw = params.group_selections.toString().trim()
+            if (raw.startsWith('[') && raw.endsWith(']')) {
+                try {
+                    group_selections_list = new JsonSlurper().parseText(raw) as List
+                } catch (Exception ignored) {
+                    // Support legacy non-JSON list syntax like:
+                    // [chainid A, chainid B, chainid C]
+                    def inner = raw.substring(1, raw.length() - 1).trim()
+                    if (inner) {
+                        group_selections_list = inner
+                            .split(/\s*,\s*/)
+                            .collect { it.toString().replaceAll(/^['\"]|['\"]$/, '') }
+                            .findAll { it }
+                    }
+                }
+            } else {
+                group_selections_list = [raw]
+            }
+        }
+    }
+    def group_arg = group_selections_list ? "--group-selections ${group_selections_list.collect { "'${it.toString().replace("'", "'\\''")}'" }.join(' ')}" : ""
+    def wrap_arg = "--wrap-selection none"
+    def strict_arg = ""
     """
     mkdir -p ${system}/${variation}
     ln -sf \$(readlink -f ${top_file}) ${system}/${variation}/${system}_system_${variation}.${params.top_format}
-    ln -sf \$(readlink -f ${traj_file}) ${system}/${variation}/${system}_production_${variation}_rep_${rep}.${params.traj_format}
+    ln -sf \$(readlink -f ${traj_file}) ${system}/${variation}/${system}_production_${variation}_rep_1.${params.traj_format}
+    ln -sf \$(readlink -f ${traj_file}) ${system}/${variation}/${system}_production_${variation}_rep1.${params.traj_format}
+
+    cp -f ${outdirAbs}/rmsf/rmsf_plot_${system}_${variation}_rep${rep}*.pkl . 2>/dev/null || true
 
     python ${scriptDir}/run_rms_analysis.py \\
         --systems '["${system}"]' \\
@@ -248,7 +455,7 @@ process RUN_RMSF {
         --start-frame ${params.start_frame} \\
         --traj-format ${params.traj_format} \\
         --top-format ${params.top_format} \\
-        ${chain_arg} ${wrap_arg}
+        ${chain_arg} ${group_arg} ${wrap_arg} ${strict_arg}
 
     for f in rmsf_plot_${system}_${variation}_rep1*.pkl; do
         newname=\$(echo "\$f" | sed "s/rep1/rep${rep}/")
@@ -260,7 +467,8 @@ process RUN_RMSF {
 process RUN_2D_RMSD {
     tag "${system}_${variation}_rep${rep}"
     label 'process_high'
-    publishDir "${params.outdir}/2d_rmsd", mode: 'copy'
+    publishDir "${outdirAbs}/2d_rmsd", mode: 'copy'
+    cache 'lenient'
 
     input:
     tuple val(system), val(variation), val(rep), path(top_file), path(traj_file)
@@ -269,11 +477,15 @@ process RUN_2D_RMSD {
     path("2d_rmsd_plot_${system}_${variation}_rep${rep}.pkl"), emit: pickle
 
     script:
-    def wrap_arg = params.wrap_selection == 'none' ? "--wrap-selection none" : (params.wrap_selection != 'auto' ? "--wrap-selection '${params.wrap_selection}'" : "")
+    def wrap_arg = "--wrap-selection none"
+    def strict_arg = ""
     """
     mkdir -p ${system}/${variation}
     ln -sf \$(readlink -f ${top_file}) ${system}/${variation}/${system}_system_${variation}.${params.top_format}
-    ln -sf \$(readlink -f ${traj_file}) ${system}/${variation}/${system}_production_${variation}_rep_${rep}.${params.traj_format}
+    ln -sf \$(readlink -f ${traj_file}) ${system}/${variation}/${system}_production_${variation}_rep_1.${params.traj_format}
+    ln -sf \$(readlink -f ${traj_file}) ${system}/${variation}/${system}_production_${variation}_rep1.${params.traj_format}
+
+    cp -f ${outdirAbs}/2d_rmsd/2d_rmsd_plot_${system}_${variation}_rep${rep}.pkl . 2>/dev/null || true
 
     python ${scriptDir}/run_rms_analysis.py \\
         --systems '["${system}"]' \\
@@ -285,7 +497,7 @@ process RUN_2D_RMSD {
         --start-frame ${params.start_frame} \\
         --traj-format ${params.traj_format} \\
         --top-format ${params.top_format} \\
-        ${wrap_arg}
+        ${wrap_arg} ${strict_arg}
 
     mv 2d_rmsd_plot_${system}_${variation}_rep1.pkl 2d_rmsd_plot_${system}_${variation}_rep${rep}.pkl || true
     """
@@ -294,7 +506,8 @@ process RUN_2D_RMSD {
 process RUN_ROG {
     tag "${system}_${variation}_rep${rep}"
     label 'process_medium'
-    publishDir "${params.outdir}/rog", mode: 'copy'
+    publishDir "${outdirAbs}/rog", mode: 'copy'
+    cache 'lenient'
 
     input:
     tuple val(system), val(variation), val(rep), path(top_file), path(traj_file)
@@ -303,11 +516,15 @@ process RUN_ROG {
     path("rog_plot_${system}_${variation}_rep${rep}.pkl"), emit: pickle
 
     script:
-    def wrap_arg = params.wrap_selection == 'none' ? "--wrap-selection none" : (params.wrap_selection != 'auto' ? "--wrap-selection '${params.wrap_selection}'" : "")
+    def wrap_arg = "--wrap-selection none"
+    def strict_arg = ""
     """
     mkdir -p ${system}/${variation}
     ln -sf \$(readlink -f ${top_file}) ${system}/${variation}/${system}_system_${variation}.${params.top_format}
-    ln -sf \$(readlink -f ${traj_file}) ${system}/${variation}/${system}_production_${variation}_rep_${rep}.${params.traj_format}
+    ln -sf \$(readlink -f ${traj_file}) ${system}/${variation}/${system}_production_${variation}_rep_1.${params.traj_format}
+    ln -sf \$(readlink -f ${traj_file}) ${system}/${variation}/${system}_production_${variation}_rep1.${params.traj_format}
+
+    cp -f ${outdirAbs}/rog/rog_plot_${system}_${variation}_rep${rep}.pkl . 2>/dev/null || true
 
     python ${scriptDir}/run_rog_analysis.py \\
         --systems '["${system}"]' \\
@@ -318,7 +535,7 @@ process RUN_ROG {
         --top-format ${params.top_format} \\
         --selection '${params.rog_selection}' \\
         --time-unit ${params.time_unit} \\
-        ${wrap_arg}
+        ${wrap_arg} ${strict_arg}
 
     mv rog_plot_${system}_${variation}_rep1.pkl rog_plot_${system}_${variation}_rep${rep}.pkl || true
     """
@@ -328,7 +545,8 @@ process RUN_HBONDS {
     tag "${system}_${variation}_rep${rep}"
     label 'process_high'
     cpus { params.parallel_backend != 'serial' && params.n_workers ? params.n_workers : (params.parallel_backend != 'serial' ? 4 : 1) }
-    publishDir "${params.outdir}/hbonds", mode: 'copy'
+    publishDir "${outdirAbs}/hbonds", mode: 'copy'
+    cache 'lenient'
 
     input:
     tuple val(system), val(variation), val(rep), path(top_file), path(traj_file)
@@ -338,21 +556,33 @@ process RUN_HBONDS {
 
     script:
     def sel_arg = ""
+    def atom_sel_arg = ""
+    if (params.acceptors_sel && params.hydrogens_sel) {
+        atom_sel_arg = "--atom-selections '${params.acceptors_sel}' '${params.hydrogens_sel}'"
+    }
+
     if (params.between_pairs) {
-        sel_arg = "--between-pairs '${params.between_pairs}'"
-    } else if (params.acceptors_sel && params.hydrogens_sel) {
-        sel_arg = "--atom-selections '${params.acceptors_sel}' '${params.hydrogens_sel}'"
+        def betweenPairsJson = (params.between_pairs instanceof Collection || params.between_pairs instanceof Map)
+            ? JsonOutput.toJson(params.between_pairs)
+            : params.between_pairs.toString()
+        sel_arg = "--between-pairs '${betweenPairsJson}' ${atom_sel_arg}"
+    } else if (atom_sel_arg) {
+        sel_arg = atom_sel_arg
     } else {
         error "H-bonds analysis requires either --acceptors_sel + --hydrogens_sel or --between_pairs"
     }
     def update_arg = params.update_selections ? "" : "--no-update-selections"
-    def wrap_arg = params.wrap_selection == 'none' ? "--wrap-selection none" : (params.wrap_selection != 'auto' ? "--wrap-selection '${params.wrap_selection}'" : "")
+    def wrap_arg = "--wrap-selection none"
+    def strict_arg = ""
     def parallel_arg = params.parallel_backend != 'serial' ? "--parallel-backend ${params.parallel_backend}" : ""
     def nworkers_arg = params.n_workers ? "--n-workers ${params.n_workers}" : ""
     """
     mkdir -p ${system}/${variation}
     ln -sf \$(readlink -f ${top_file}) ${system}/${variation}/${system}_system_${variation}.${params.top_format}
-    ln -sf \$(readlink -f ${traj_file}) ${system}/${variation}/${system}_production_${variation}_rep_${rep}.${params.traj_format}
+    ln -sf \$(readlink -f ${traj_file}) ${system}/${variation}/${system}_production_${variation}_rep_1.${params.traj_format}
+    ln -sf \$(readlink -f ${traj_file}) ${system}/${variation}/${system}_production_${variation}_rep1.${params.traj_format}
+
+    cp -f ${outdirAbs}/hbonds/hbonds_plot_${system}_${variation}_rep${rep}.pkl . 2>/dev/null || true
 
     python ${scriptDir}/run_hbonds_analysis.py \\
         --systems '["${system}"]' \\
@@ -364,7 +594,7 @@ process RUN_HBONDS {
         --d-a-cutoff ${params.d_a_cutoff} \\
         --d-h-a-angle-cutoff ${params.d_h_a_angle_cutoff} \\
         ${update_arg} \\
-        ${sel_arg} ${wrap_arg} ${parallel_arg} ${nworkers_arg}
+        ${sel_arg} ${wrap_arg} ${strict_arg} ${parallel_arg} ${nworkers_arg}
 
     mv hbonds_plot_${system}_${variation}_rep1.pkl hbonds_plot_${system}_${variation}_rep${rep}.pkl || true
     """
@@ -375,7 +605,8 @@ process RUN_HBONDS {
 process PLOT_RMSD {
     tag "${pickle.baseName}"
     label 'process_low'
-    publishDir "${params.outdir}/plots/rmsd", mode: 'copy'
+    publishDir "${outdirAbs}/plots/rmsd", mode: 'copy'
+    cache 'lenient'
 
     input:
     path(pickle)
@@ -392,10 +623,39 @@ process PLOT_RMSD {
     """
 }
 
+process PLOT_RMSD_GROUPS {
+    label 'process_low'
+    publishDir "${outdirAbs}/plots/rmsd", mode: 'copy'
+    cache 'lenient'
+
+    input:
+    path(plot_pngs)
+
+    output:
+    path("rmsd_comparison_*.png"), emit: plot, optional: true
+
+    script:
+    def plotGroupsArg = (params.plot_groups instanceof Map || params.plot_groups instanceof Collection)
+        ? JsonOutput.toJson(params.plot_groups)
+        : params.plot_groups
+    """
+    python ${scriptDir}/plot_group_comparisons.py \\
+        --analysis rmsd \\
+        --plot-groups '${plotGroupsArg}' \\
+        --work-dir '${outdirAbs}/rmsd' \\
+        --output-dir . \\
+        --num-replicates ${params.num_replicates} \\
+        --replicate-mode '${params.replicate_mode}' \\
+        --dpi ${params.dpi} \\
+        --rmsd-show-kde ${params.rmsd_show_kde}
+    """
+}
+
 process PLOT_RMSF {
     tag "${pickle.baseName}"
     label 'process_low'
-    publishDir "${params.outdir}/plots/rmsf", mode: 'copy'
+    publishDir "${outdirAbs}/plots/rmsf", mode: 'copy'
+    cache 'lenient'
 
     input:
     path(pickle)
@@ -412,10 +672,39 @@ process PLOT_RMSF {
     """
 }
 
+process PLOT_RMSF_GROUPS {
+    label 'process_low'
+    publishDir "${outdirAbs}/plots/rmsf", mode: 'copy'
+    cache 'lenient'
+
+    input:
+    path(plot_pngs)
+
+    output:
+    path("rmsf_comparison_*.png"), emit: plot, optional: true
+
+    script:
+    def plotGroupsArg = (params.plot_groups instanceof Map || params.plot_groups instanceof Collection)
+        ? JsonOutput.toJson(params.plot_groups)
+        : params.plot_groups
+    """
+    python ${scriptDir}/plot_group_comparisons.py \\
+        --analysis rmsf \\
+        --plot-groups '${plotGroupsArg}' \\
+        --work-dir '${outdirAbs}/rmsf' \\
+        --output-dir . \\
+        --num-replicates ${params.num_replicates} \\
+        --replicate-mode '${params.replicate_mode}' \\
+        --target-selection '${params.target_selection}' \\
+        --dpi ${params.dpi}
+    """
+}
+
 process PLOT_2D_RMSD {
     tag "${pickle.baseName}"
     label 'process_low'
-    publishDir "${params.outdir}/plots/2d_rmsd", mode: 'copy'
+    publishDir "${outdirAbs}/plots/2d_rmsd", mode: 'copy'
+    cache 'lenient'
 
     input:
     path(pickle)
@@ -435,7 +724,8 @@ process PLOT_2D_RMSD {
 process PLOT_ROG {
     tag "${pickle.baseName}"
     label 'process_low'
-    publishDir "${params.outdir}/plots/rog", mode: 'copy'
+    publishDir "${outdirAbs}/plots/rog", mode: 'copy'
+    cache 'lenient'
 
     input:
     path(pickle)
@@ -455,7 +745,8 @@ process PLOT_ROG {
 process PLOT_HBONDS {
     tag "${pickle.baseName}"
     label 'process_low'
-    publishDir "${params.outdir}/plots/hbonds", mode: 'copy'
+    publishDir "${outdirAbs}/plots/hbonds", mode: 'copy'
+    cache 'lenient'
 
     input:
     path(pickle)

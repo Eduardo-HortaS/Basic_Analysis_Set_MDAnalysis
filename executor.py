@@ -24,7 +24,7 @@ import time as _time
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, SCRIPT_DIR)
 
-from utils import validate_time_unit, SUPPORTED_TIME_UNITS
+from utils import validate_time_unit, SUPPORTED_TIME_UNITS, resolve_trajectory_file, cleanup_work_directory
 from parallelization import VALID_BACKENDS
 
 
@@ -229,14 +229,61 @@ def load_config(ini_path):
         )
         sys.exit(1)
 
-    cfg['group_selections'] = _parse_optional_json(
-        cp.get('rmsd', 'group_selections', fallback='none'))
+    _raw_group_selections = cp.get('rmsd', 'group_selections', fallback='none')
+    try:
+        cfg['group_selections'] = _parse_optional_json(_raw_group_selections)
+    except json.JSONDecodeError as e:
+        raw = (_raw_group_selections or '').strip()
+        # Support legacy syntax like: [chainid A, chainid B, chainid C]
+        if raw.startswith('[') and raw.endswith(']'):
+            inner = raw[1:-1].strip()
+            if inner:
+                parsed = []
+                for token in inner.split(','):
+                    item = token.strip().strip('"\'')
+                    if item:
+                        parsed.append(item)
+                cfg['group_selections'] = parsed if parsed else None
+            else:
+                cfg['group_selections'] = None
+        else:
+            print(
+                "ERROR: Invalid JSON for [rmsd] group_selections.\n"
+                "  Use a JSON list, e.g.: [\"segid A\", \"segid B\", \"segid C\"]\n"
+                f"  Parser error: {e}"
+            )
+            sys.exit(1)
+
+    if cfg['group_selections'] is not None:
+        if not isinstance(cfg['group_selections'], list):
+            print(
+                "ERROR: [rmsd] group_selections must be a JSON list of selection strings.\n"
+                f"  Got: {type(cfg['group_selections']).__name__}"
+            )
+            sys.exit(1)
+        cfg['group_selections'] = [str(s).strip() for s in cfg['group_selections'] if str(s).strip()]
+        if not cfg['group_selections']:
+            cfg['group_selections'] = None
 
     # ── [rmsf] — RMSF-specific ────────────────────────────────────────────
     raw_chain_intervals = _parse_optional_json(
         cp.get('rmsf', 'chain_intervals', fallback='none'))
     cfg['chain_intervals'] = _normalize_chain_intervals(
         raw_chain_intervals, cfg['systems'])
+
+    cfg['rmsf_group_selections'] = _parse_optional_json(
+        cp.get('rmsf', 'group_selections', fallback='none'))
+
+    if cfg['rmsf_group_selections'] is not None:
+        if not isinstance(cfg['rmsf_group_selections'], list):
+            print(
+                "ERROR: [rmsf] group_selections must be a JSON list of selection strings.\n"
+                f"  Got: {type(cfg['rmsf_group_selections']).__name__}"
+            )
+            sys.exit(1)
+        cfg['rmsf_group_selections'] = [str(s).strip() for s in cfg['rmsf_group_selections'] if str(s).strip()]
+        if not cfg['rmsf_group_selections']:
+            cfg['rmsf_group_selections'] = None
 
     # ── [hbonds] — H-bond specific ────────────────────────────────────────
     cfg['d_a_cutoff'] = float(cp.get('hbonds', 'd_a_cutoff', fallback='3.5'))
@@ -245,6 +292,23 @@ def load_config(ini_path):
     cfg['acceptors_sel'] = _parse_optional_str(cp.get('hbonds', 'acceptors_sel', fallback='none'))
     cfg['hydrogens_sel'] = _parse_optional_str(cp.get('hbonds', 'hydrogens_sel', fallback='none'))
     cfg['between_pairs'] = _parse_optional_json(cp.get('hbonds', 'between_pairs', fallback='none'))
+    if cfg['between_pairs'] is not None:
+        if not isinstance(cfg['between_pairs'], list):
+            print(
+                "ERROR: [hbonds] between_pairs must be a JSON list of [selection1, selection2] pairs."
+            )
+            sys.exit(1)
+        cleaned_pairs = []
+        for pair in cfg['between_pairs']:
+            if not isinstance(pair, (list, tuple)) or len(pair) != 2:
+                print(f"ERROR: Invalid between_pairs entry: {pair!r}. Expected [selection1, selection2].")
+                sys.exit(1)
+            a, b = str(pair[0]).strip(), str(pair[1]).strip()
+            if not a or not b:
+                print(f"ERROR: between_pairs entries cannot be empty: {pair!r}")
+                sys.exit(1)
+            cleaned_pairs.append([a, b])
+        cfg['between_pairs'] = cleaned_pairs
 
     # ── [parallelization] — parallel backend settings ───────────────────
     _parallel_backend = cp.get('parallelization', 'backend', fallback='serial').strip().lower()
@@ -268,7 +332,10 @@ def load_config(ini_path):
     cfg['plot_groups'] = {}
     cfg['replicate_mode'] = 'separate'  # default
     if cp.has_section('plot_groups'):
-        cfg['replicate_mode'] = cp.get('plot_groups', 'replicate_mode', fallback='separate').strip()
+        cfg['replicate_mode'] = cp.get('plot_groups', 'replicate_mode', fallback='separate').strip().lower()
+        if cfg['replicate_mode'] not in ('separate', 'average'):
+            print(f"WARNING: Unknown replicate_mode '{cfg['replicate_mode']}'. Falling back to 'separate'.")
+            cfg['replicate_mode'] = 'separate'
         for key in cp.options('plot_groups'):
             if key == 'replicate_mode':
                 continue
@@ -400,6 +467,7 @@ def run_rmsd(cfg, dry_run=False):
             output_dir=os.path.join(cfg['_work_dir'], _ANALYSIS_SUBDIRS['rmsd']),
             parallel_backend=cfg['parallel_backend'],
             n_workers=cfg['n_workers'],
+            strict_wrapping=cfg['strict_wrapping'],
         )
 
 
@@ -430,9 +498,13 @@ def run_rmsf(cfg, dry_run=False):
         start_frame=cfg['start_frame'],
         traj_format=cfg['traj_format'],
         top_format=cfg['top_format'],
+        group_selections=cfg['rmsf_group_selections'],
         chain_intervals=cfg['chain_intervals'],
         wrap_selection=cfg['wrap_selection'],
         output_dir=os.path.join(cfg['_work_dir'], _ANALYSIS_SUBDIRS['rmsf']),
+        parallel_backend=cfg['parallel_backend'],
+        n_workers=cfg['n_workers'],
+        strict_wrapping=cfg['strict_wrapping'],
     )
 
 
@@ -467,6 +539,7 @@ def run_2d_rmsd(cfg, dry_run=False):
         top_format=cfg['top_format'],
         wrap_selection=cfg['wrap_selection'],
         output_dir=os.path.join(cfg['_work_dir'], _ANALYSIS_SUBDIRS['2d_rmsd']),
+        strict_wrapping=cfg['strict_wrapping'],
     )
 
 
@@ -493,6 +566,7 @@ def run_rog(cfg, dry_run=False):
         time_unit=cfg['time_unit'],
         wrap_selection=cfg['wrap_selection'],
         output_dir=os.path.join(cfg['_work_dir'], _ANALYSIS_SUBDIRS['rog']),
+        strict_wrapping=cfg['strict_wrapping'],
     )
 
 
@@ -529,6 +603,7 @@ def run_hbonds(cfg, dry_run=False):
         output_dir=os.path.join(cfg['_work_dir'], _ANALYSIS_SUBDIRS['hbonds']),
         parallel_backend=cfg['parallel_backend'],
         n_workers=cfg['n_workers'],
+        strict_wrapping=cfg['strict_wrapping'],
     )
 
 
@@ -580,7 +655,8 @@ def plot_rmsd_results(cfg, work_dir, dry_run=False):
 
     # ── Comparison group plots ────────────────────────────────────────────
     if cfg.get('plot_groups'):
-        _plot_rmsd_comparison_groups(cfg, work_dir, plot_dir, pickles, dry_run)
+        rmsd_dir = os.path.join(work_dir, _ANALYSIS_SUBDIRS['rmsd'])
+        _plot_rmsd_comparison_groups(cfg, rmsd_dir, plot_dir, pickles, dry_run)
 
 
 def plot_rmsf_results(cfg, work_dir, dry_run=False):
@@ -605,7 +681,8 @@ def plot_rmsf_results(cfg, work_dir, dry_run=False):
 
     # ── Comparison group plots ────────────────────────────────────────────
     if cfg.get('plot_groups'):
-        _plot_rmsf_comparison_groups(cfg, work_dir, plot_dir, pickles, dry_run)
+        rmsf_dir = os.path.join(work_dir, _ANALYSIS_SUBDIRS['rmsf'])
+        _plot_rmsf_comparison_groups(cfg, rmsf_dir, plot_dir, pickles, dry_run)
 
 
 # ─── Comparison-group helper functions ────────────────────────────────────────
@@ -1011,8 +1088,13 @@ def validate_inputs(cfg):
             for rep in range(1, cfg['num_replicates'] + 1):
                 top = os.path.join(input_dir, system, variation,
                                    f'{system}_system_{variation}.{cfg["top_format"]}')
-                traj = os.path.join(input_dir, system, variation,
-                                    f'{system}_production_{variation}_rep_{rep}.{cfg["traj_format"]}')
+                traj, traj_candidates = resolve_trajectory_file(
+                    system,
+                    variation,
+                    rep,
+                    cfg['traj_format'],
+                    base_dir=input_dir,
+                )
 
                 if not os.path.isfile(top):
                     missing.append(f"Topology not found: {top}")
@@ -1020,7 +1102,10 @@ def validate_inputs(cfg):
                     found += 1
 
                 if not os.path.isfile(traj):
-                    missing.append(f"Trajectory not found: {traj}")
+                    attempted = ', '.join(
+                        os.path.join(input_dir, rel) for rel in traj_candidates
+                    )
+                    missing.append(f"Trajectory not found (tried: {attempted})")
                 else:
                     found += 1
 
@@ -1114,11 +1199,14 @@ See example_pipeline.ini for a complete template."""
                         help='Run analyses but skip plotting')
     parser.add_argument('--plot-only', action='store_true',
                         help='Skip analyses and only generate plots from existing pickles')
+    parser.add_argument('--strict-wrapping', action='store_true',
+                        help='Fail if trajectory lacks fragment data for PBC wrapping (default: warn and use residue-based fallback)')
 
     args = parser.parse_args()
 
     # Load config
     cfg = load_config(args.config)
+    cfg['strict_wrapping'] = args.strict_wrapping
     if args.analysis_only:
         cfg['run_plots'] = False
     if args.plot_only:
@@ -1232,6 +1320,10 @@ See example_pipeline.ini for a complete template."""
 
             if cfg['plot_hbonds']:
                 plot_hbonds_results(cfg, work_dir, dry_run=args.dry_run)
+
+            # Clean up intermediate files, preserving analysis outputs
+            if not args.dry_run:
+                cleanup_work_directory(work_dir, verbose=True)
 
     finally:
         os.chdir(original_dir)
