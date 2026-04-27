@@ -16,7 +16,13 @@ import matplotlib.pyplot as plt
 
 import sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from style import apply_style, get_color_cycle, prettify_label, DEFAULT_DPI, DEFAULT_FIGSIZE
+from style import (
+    apply_style,
+    get_color_cycle,
+    prettify_label,
+    DEFAULT_DPI,
+    DEFAULT_FIGSIZE,
+)
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from utils import convert_time_from_ps, time_unit_label
@@ -215,9 +221,10 @@ def plot_hbonds(pickle_file, output_dir='.', dpi=DEFAULT_DPI, plot_types=None,
     count_by_time = hbonds['count_by_time']
     count_by_type = hbonds['count_by_type']
     count_by_ids = hbonds['count_by_ids']
+    hbonds_preset = hbonds.get('hbonds_preset')
 
     if label is None:
-        label = os.path.splitext(os.path.basename(pickle_file))[0].replace('hbonds_plot_', '')
+        label = hbonds_preset or os.path.splitext(os.path.basename(pickle_file))[0].replace('hbonds_plot_', '')
     label = prettify_label(label)
 
     os.makedirs(output_dir, exist_ok=True)

@@ -19,12 +19,22 @@ import json
 import argparse
 import configparser
 import time as _time
+import MDAnalysis as mda
 
 # ─── Ensure repo root is importable ──────────────────────────────────────────
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, SCRIPT_DIR)
 
-from utils import validate_time_unit, SUPPORTED_TIME_UNITS, resolve_trajectory_file, cleanup_work_directory
+from utils import (
+    validate_time_unit,
+    SUPPORTED_TIME_UNITS,
+    resolve_trajectory_file,
+    resolve_topology_file,
+    resolve_reference_pdb_file,
+    cleanup_work_directory,
+    build_complex_selection,
+    transform_trajectory,
+)
 from parallelization import VALID_BACKENDS
 
 
@@ -54,6 +64,26 @@ def _parse_optional_str(value):
 def _parse_optional_float(value):
     v = _parse_optional_str(value)
     return float(v) if v is not None else None
+
+
+TIME_INTERVAL_BETWEEN_FRAMES_MIN_PS = 1e-6
+TIME_INTERVAL_BETWEEN_FRAMES_MAX_PS = 1e6
+
+
+def _validate_time_interval_between_frames(value):
+    """Validate the RMSD frame interval using a bounded sanity range."""
+    if value is None:
+        return None
+    if value <= 0:
+        raise ValueError(
+            "time_interval_between_frames must be greater than zero (ps)."
+        )
+    if not (TIME_INTERVAL_BETWEEN_FRAMES_MIN_PS <= value <= TIME_INTERVAL_BETWEEN_FRAMES_MAX_PS):
+        raise ValueError(
+            "time_interval_between_frames is outside the supported sanity range "
+            f"[{TIME_INTERVAL_BETWEEN_FRAMES_MIN_PS}, {TIME_INTERVAL_BETWEEN_FRAMES_MAX_PS}] ps."
+        )
+    return value
 
 
 def _parse_optional_int(value):
@@ -131,7 +161,10 @@ def load_config(ini_path):
         print(f"ERROR: Config file not found: {ini_path}")
         sys.exit(1)
 
-    cp = configparser.ConfigParser(interpolation=configparser.ExtendedInterpolation())
+    cp = configparser.ConfigParser(
+        interpolation=configparser.ExtendedInterpolation(),
+        inline_comment_prefixes=(';', '#'),
+    )
     cp.read(ini_path, encoding='utf-8')
 
     cfg = {}
@@ -213,6 +246,8 @@ def load_config(ini_path):
     # ── [rmsd] — RMSD-specific ────────────────────────────────────────────
     cfg['time_interval_between_frames'] = _parse_optional_float(
         cp.get('rmsd', 'time_interval_between_frames', fallback='none'))
+    cfg['time_interval_between_frames'] = _validate_time_interval_between_frames(
+        cfg['time_interval_between_frames'])
 
     # time_interval_between_frames is mandatory when RMSD is enabled — it
     # cannot be inferred from trajectory files (especially DCD).
@@ -289,6 +324,8 @@ def load_config(ini_path):
     cfg['d_a_cutoff'] = float(cp.get('hbonds', 'd_a_cutoff', fallback='3.5'))
     cfg['d_h_a_angle_cutoff'] = float(cp.get('hbonds', 'd_h_a_angle_cutoff', fallback='150.0'))
     cfg['update_selections'] = _parse_bool(cp.get('hbonds', 'update_selections', fallback='true'))
+    cfg['hbonds_preset'] = (_parse_optional_str(
+        cp.get('hbonds', 'hbonds_preset', fallback='custom')) or 'custom').lower()
     cfg['acceptors_sel'] = _parse_optional_str(cp.get('hbonds', 'acceptors_sel', fallback='none'))
     cfg['hydrogens_sel'] = _parse_optional_str(cp.get('hbonds', 'hydrogens_sel', fallback='none'))
     cfg['between_pairs'] = _parse_optional_json(cp.get('hbonds', 'between_pairs', fallback='none'))
@@ -428,6 +465,64 @@ def _clean_ephemeral_files(work_dir):
     return removed
 
 
+def preprocess_wrapped_trajectories(cfg, dry_run=False):
+    """Create wrapped trajectories once so all analyses reuse corrected inputs."""
+    wrapped_manifest = {}
+
+    if cfg.get('wrap_selection') is None:
+        print("  Wrapping disabled: wrap_selection=None")
+        return wrapped_manifest
+
+    wrapped_dir = os.path.join(cfg['_work_dir'], 'wrapped')
+    os.makedirs(wrapped_dir, exist_ok=True)
+
+    print(f"\n{'='*60}")
+    print("  PREPROCESSING WRAPPED TRAJECTORIES")
+    print(f"{'='*60}")
+
+    for system in cfg['systems']:
+        for variation in cfg['variations'][system]:
+            for rep in range(1, cfg['num_replicates'] + 1):
+                traj_file, _ = resolve_trajectory_file(system, variation, rep, cfg['traj_format'])
+                top_file, _ = resolve_topology_file(system, variation, cfg['top_format'])
+                wrapped_path = os.path.join(
+                    wrapped_dir,
+                    f'wrapped_{system}_production_{variation}_rep{rep}.{cfg["traj_format"]}',
+                )
+
+                wrapped_manifest[(system, variation, rep)] = wrapped_path
+
+                if os.path.exists(wrapped_path):
+                    print(f"  Reusing wrapped trajectory: {os.path.basename(wrapped_path)}")
+                    continue
+
+                if dry_run:
+                    print(f"  [DRY RUN] Would create wrapped trajectory: {wrapped_path}")
+                    continue
+
+                print(f"  Wrapping {system}, {variation}, replicate {rep}...")
+                u = mda.Universe(top_file, traj_file)
+                center_ag, ligand_ag, wrap_ag = build_complex_selection(u, wrap_selection=cfg['wrap_selection'])
+                if center_ag is None:
+                    # Keep original trajectory path when wrapping is effectively disabled.
+                    wrapped_manifest[(system, variation, rep)] = traj_file
+                    continue
+
+                transform_trajectory(
+                    u,
+                    center_ag,
+                    wrap_ag,
+                    ligand_selection=ligand_ag,
+                    strict_wrapping=cfg['strict_wrapping'],
+                )
+
+                with mda.Writer(wrapped_path, n_atoms=u.atoms.n_atoms) as writer:
+                    for _ts in u.trajectory:
+                        writer.write(u.atoms)
+
+    return wrapped_manifest
+
+
 # ─── Analysis runners ────────────────────────────────────────────────────────
 
 def run_rmsd(cfg, dry_run=False):
@@ -464,6 +559,9 @@ def run_rmsd(cfg, dry_run=False):
             time_unit=cfg['time_unit'],
             ref_suffix=ref_suffix,
             wrap_selection=cfg['wrap_selection'],
+            wrapped_manifest=cfg.get('_wrapped_manifest'),
+            input_dir=cfg['input_dir'],
+            require_reference_pdb=True,
             output_dir=os.path.join(cfg['_work_dir'], _ANALYSIS_SUBDIRS['rmsd']),
             parallel_backend=cfg['parallel_backend'],
             n_workers=cfg['n_workers'],
@@ -501,6 +599,9 @@ def run_rmsf(cfg, dry_run=False):
         group_selections=cfg['rmsf_group_selections'],
         chain_intervals=cfg['chain_intervals'],
         wrap_selection=cfg['wrap_selection'],
+        wrapped_manifest=cfg.get('_wrapped_manifest'),
+        input_dir=cfg['input_dir'],
+        require_reference_pdb=True,
         output_dir=os.path.join(cfg['_work_dir'], _ANALYSIS_SUBDIRS['rmsf']),
         parallel_backend=cfg['parallel_backend'],
         n_workers=cfg['n_workers'],
@@ -538,6 +639,9 @@ def run_2d_rmsd(cfg, dry_run=False):
         traj_format=cfg['traj_format'],
         top_format=cfg['top_format'],
         wrap_selection=cfg['wrap_selection'],
+        wrapped_manifest=cfg.get('_wrapped_manifest'),
+        input_dir=cfg['input_dir'],
+        require_reference_pdb=True,
         output_dir=os.path.join(cfg['_work_dir'], _ANALYSIS_SUBDIRS['2d_rmsd']),
         strict_wrapping=cfg['strict_wrapping'],
     )
@@ -565,6 +669,9 @@ def run_rog(cfg, dry_run=False):
         selection=cfg['rog_selection'],
         time_unit=cfg['time_unit'],
         wrap_selection=cfg['wrap_selection'],
+        wrapped_manifest=cfg.get('_wrapped_manifest'),
+        input_dir=cfg['input_dir'],
+        require_reference_pdb=True,
         output_dir=os.path.join(cfg['_work_dir'], _ANALYSIS_SUBDIRS['rog']),
         strict_wrapping=cfg['strict_wrapping'],
     )
@@ -599,7 +706,11 @@ def run_hbonds(cfg, dry_run=False):
         hydrogens_sel=cfg['hydrogens_sel'],
         between_pairs=cfg['between_pairs'],
         update_selections=cfg['update_selections'],
+        hbonds_preset=cfg.get('hbonds_preset', 'custom'),
         wrap_selection=cfg['wrap_selection'],
+        wrapped_manifest=cfg.get('_wrapped_manifest'),
+        input_dir=cfg['input_dir'],
+        require_reference_pdb=True,
         output_dir=os.path.join(cfg['_work_dir'], _ANALYSIS_SUBDIRS['hbonds']),
         parallel_backend=cfg['parallel_backend'],
         n_workers=cfg['n_workers'],
@@ -609,7 +720,7 @@ def run_hbonds(cfg, dry_run=False):
 
 # ─── Plotting runners ────────────────────────────────────────────────────────
 
-def _collect_pickles(work_dir, prefix, cfg, analysis_type=None):
+def _collect_pickles(work_dir, prefix, cfg, analysis_type=None, prune_stale_duplicates=False):
     """
     Find all pickle files matching a prefix for the configured systems.
     Returns a sorted list of absolute paths.
@@ -630,14 +741,62 @@ def _collect_pickles(work_dir, prefix, cfg, analysis_type=None):
     pickles = []
     for pat in patterns:
         pickles.extend(glob.glob(pat))
-    return sorted(set(pickles))
+
+    # Prefer canonical pickles over stale duplicate artifacts from older
+    # configurations. This keeps plot collection aligned with the current
+    # logical selection set even when legacy *_selN.pkl files still exist.
+    deduped = []
+    seen_keys = set()
+    for pkl_path in sorted(set(pickles)):
+        basename = os.path.basename(pkl_path)
+        import re
+
+        sel_match = re.search(r'_sel(\d+)\.pkl$', basename)
+        chain_match = re.search(r'_chain([A-Za-z0-9]+)\.pkl$', basename)
+        chain_id = chain_match.group(1) if chain_match else ''
+
+        metadata = None
+        try:
+            import pickle
+            with open(pkl_path, 'rb') as f:
+                metadata = pickle.load(f)
+        except Exception:
+            metadata = None
+
+        if isinstance(metadata, dict):
+            selection = metadata.get('selection', '')
+            ref_selection = metadata.get('ref_selection', '')
+            if analysis_type == 'rmsf':
+                key = ('rmsf', selection, ref_selection, chain_id)
+            else:
+                key = ('rmsd', selection, ref_selection)
+        else:
+            key = (analysis_type or 'generic', basename)
+
+        # Keep the first canonical pickle we encounter for each logical key.
+        # Canonical files (without *_selN) sort before legacy duplicates, so
+        # they win naturally.
+        if key in seen_keys:
+            if sel_match:
+                print(f"  NOTE: Ignoring stale duplicate pickle: {basename}")
+                if prune_stale_duplicates:
+                    try:
+                        os.unlink(pkl_path)
+                        print(f"  NOTE: Removed stale duplicate pickle: {basename}")
+                    except OSError:
+                        pass
+            continue
+        seen_keys.add(key)
+        deduped.append(pkl_path)
+
+    return deduped
 
 
 def plot_rmsd_results(cfg, work_dir, dry_run=False):
     """Plot all RMSD results — individual + comparison group overlays."""
     from plotting.plot_rmsd import plot_rmsd, plot_rmsd_comparison, plot_rmsd_comparison_average
 
-    pickles = _collect_pickles(work_dir, 'rmsd_plot', cfg, analysis_type='rmsd')
+    pickles = _collect_pickles(work_dir, 'rmsd_plot', cfg, analysis_type='rmsd', prune_stale_duplicates=not dry_run)
     if not pickles:
         print("  No RMSD pickle files found to plot.")
         return
@@ -663,7 +822,7 @@ def plot_rmsf_results(cfg, work_dir, dry_run=False):
     """Plot all RMSF results — individual + comparison group overlays."""
     from plotting.plot_rmsf import plot_rmsf, plot_rmsf_comparison, plot_rmsf_comparison_average
 
-    pickles = _collect_pickles(work_dir, 'rmsf_plot', cfg, analysis_type='rmsf')
+    pickles = _collect_pickles(work_dir, 'rmsf_plot', cfg, analysis_type='rmsf', prune_stale_duplicates=not dry_run)
     if not pickles:
         print("  No RMSF pickle files found to plot.")
         return
@@ -755,6 +914,19 @@ def _get_selection_label_from_pickle(pkl_path):
     return '', ''
 
 
+def _get_rmsf_selection_label_from_pickle(pkl_path):
+    """Read selection metadata from an RMSF pickle dict when available."""
+    import pickle
+    try:
+        with open(pkl_path, 'rb') as f:
+            data = pickle.load(f)
+        if isinstance(data, dict):
+            return data.get('selection', ''), data.get('ref_selection', '')
+    except Exception:
+        pass
+    return '', ''
+
+
 def _plot_rmsd_comparison_groups(cfg, work_dir, plot_dir, all_pickles, dry_run):
     """Generate RMSD comparison plots for each named plot_group."""
     from plotting.plot_rmsd import plot_rmsd_comparison, plot_rmsd_comparison_average
@@ -799,9 +971,12 @@ def _plot_rmsd_comparison_groups(cfg, work_dir, plot_dir, all_pickles, dry_run):
                         continue
 
                     # Build subtitle showing selection and ref_selection
-                    subtitle = selection_label
-                    if ref_selection_label and ref_selection_label != selection_label:
-                        subtitle = f'{selection_label} (aligned on: {ref_selection_label})'
+                    subtitle_parts = []
+                    if selection_label:
+                        subtitle_parts.append(f"target={selection_label}")
+                    if ref_selection_label:
+                        subtitle_parts.append(f"ref={ref_selection_label}")
+                    subtitle = ' | '.join(subtitle_parts)
 
                     print(f"  Plotting averaged RMSD comparison: {gname}")
                     plot_rmsd_comparison_average(
@@ -837,9 +1012,12 @@ def _plot_rmsd_comparison_groups(cfg, work_dir, plot_dir, all_pickles, dry_run):
                             continue
 
                         # Build subtitle showing selection and ref_selection
-                        subtitle = selection_label
-                        if ref_selection_label and ref_selection_label != selection_label:
-                            subtitle = f'{selection_label} (aligned on: {ref_selection_label})'
+                        subtitle_parts = []
+                        if selection_label:
+                            subtitle_parts.append(f"target={selection_label}")
+                        if ref_selection_label:
+                            subtitle_parts.append(f"ref={ref_selection_label}")
+                        subtitle = ' | '.join(subtitle_parts)
 
                         print(f"  Plotting RMSD comparison: {gname}")
                         plot_rmsd_comparison(
@@ -876,6 +1054,8 @@ def _plot_rmsf_comparison_groups(cfg, work_dir, plot_dir, all_pickles, dry_run):
                 pickle_groups = []
                 labels = []
 
+                selection_label = ''
+                ref_selection_label = ''
                 for system, variation in members:
                     rep_pickles = []
                     for rep in range(1, cfg['num_replicates'] + 1):
@@ -886,6 +1066,8 @@ def _plot_rmsf_comparison_groups(cfg, work_dir, plot_dir, all_pickles, dry_run):
                         matches = glob.glob(pattern)
                         if matches:
                             rep_pickles.append(matches[0])
+                            if not selection_label:
+                                selection_label, ref_selection_label = _get_rmsf_selection_label_from_pickle(matches[0])
                     if rep_pickles:
                         pickle_groups.append(rep_pickles)
                         labels.append(f'{system} / {variation}')
@@ -902,12 +1084,19 @@ def _plot_rmsf_comparison_groups(cfg, work_dir, plot_dir, all_pickles, dry_run):
                 plot_rmsf_comparison_average(
                     pickle_groups, labels, gname,
                     output_dir=plot_dir, dpi=cfg['dpi'],
-                    selection_label=cfg.get('target_selection'),
+                    selection_label=' | '.join(
+                        p for p in (
+                            f"target={selection_label}" if selection_label else '',
+                            f"ref={ref_selection_label}" if ref_selection_label else '',
+                        ) if p
+                    ),
                 )
             else:
                 for rep in range(1, cfg['num_replicates'] + 1):
                     pkl_files = []
                     labels = []
+                    selection_label = ''
+                    ref_selection_label = ''
 
                     for system, variation in members:
                         if chain_id:
@@ -918,6 +1107,8 @@ def _plot_rmsf_comparison_groups(cfg, work_dir, plot_dir, all_pickles, dry_run):
                         if matches:
                             pkl_files.append(matches[0])
                             labels.append(f'{system} / {variation}')
+                            if not selection_label:
+                                selection_label, ref_selection_label = _get_rmsf_selection_label_from_pickle(matches[0])
 
                     if not pkl_files:
                         continue
@@ -933,7 +1124,12 @@ def _plot_rmsf_comparison_groups(cfg, work_dir, plot_dir, all_pickles, dry_run):
                     plot_rmsf_comparison(
                         pkl_files, labels, gname,
                         output_dir=plot_dir, dpi=cfg['dpi'],
-                        selection_label=cfg.get('target_selection'),
+                        selection_label=' | '.join(
+                            p for p in (
+                                f"target={selection_label}" if selection_label else '',
+                                f"ref={ref_selection_label}" if ref_selection_label else '',
+                            ) if p
+                        ),
                     )
 
 
@@ -1088,6 +1284,11 @@ def validate_inputs(cfg):
             for rep in range(1, cfg['num_replicates'] + 1):
                 top = os.path.join(input_dir, system, variation,
                                    f'{system}_system_{variation}.{cfg["top_format"]}')
+                ref_pdb, _ = resolve_reference_pdb_file(
+                    system,
+                    variation,
+                    base_dir=input_dir,
+                )
                 traj, traj_candidates = resolve_trajectory_file(
                     system,
                     variation,
@@ -1106,6 +1307,11 @@ def validate_inputs(cfg):
                         os.path.join(input_dir, rel) for rel in traj_candidates
                     )
                     missing.append(f"Trajectory not found (tried: {attempted})")
+                else:
+                    found += 1
+
+                if not os.path.isfile(ref_pdb):
+                    missing.append(f"Reference PDB not found: {ref_pdb}")
                 else:
                     found += 1
 
@@ -1153,6 +1359,7 @@ def print_config_summary(cfg):
     if cfg['run_rmsf'] and cfg['chain_intervals']:
         print(f"  RMSF chains: {cfg['chain_intervals']}")
     if cfg['run_hbonds']:
+        print(f"  H-bonds preset: {cfg.get('hbonds_preset', 'custom')}")
         if cfg['between_pairs']:
             print(f"  H-bonds:     pair-focused ({len(cfg['between_pairs'])} pairs)")
         elif cfg['acceptors_sel']:
@@ -1280,6 +1487,11 @@ See example_pipeline.ini for a complete template."""
 
         # ── Run analyses ──────────────────────────────────────────────────
         if not args.plot_only:
+            if cfg.get('wrap_selection') is not None:
+                cfg['_wrapped_manifest'] = preprocess_wrapped_trajectories(cfg, dry_run=args.dry_run)
+            else:
+                cfg['_wrapped_manifest'] = {}
+
             if cfg['run_rmsd']:
                 run_rmsd(cfg, dry_run=args.dry_run)
 

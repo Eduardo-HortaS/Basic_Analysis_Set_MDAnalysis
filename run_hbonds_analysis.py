@@ -6,8 +6,74 @@ import numpy as np
 import MDAnalysis as mda
 from MDAnalysis.analysis import hydrogenbonds
 from MDAnalysis.exceptions import NoDataError
-from utils import transform_trajectory, build_complex_selection, resolve_trajectory_file
+from utils import (
+    transform_trajectory,
+    build_complex_selection,
+    resolve_trajectory_file,
+    resolve_topology_file,
+    resolve_reference_pdb_file,
+)
 from parallelization import ParallelConfig, get_run_kwargs, safe_run
+
+
+VALID_HBOND_PRESETS = {
+    'custom',
+    'protein_protein',
+    'protein_nucleic',
+    'protein_ligand',
+}
+
+
+def _hbond_preset_defaults(preset):
+    """Return default selection configuration for a known H-bond preset."""
+    if preset == 'protein_protein':
+        return {
+            'acceptors_sel': 'protein and name O OXT OT1 OT2 OD1 OD2 OE1 OE2 OG OG1 OH ND1 NE2 N',
+            'hydrogens_sel': 'protein and name H* HN HT* HXT',
+            'between_pairs': [['protein', 'protein']],
+        }
+    if preset == 'protein_nucleic':
+        return {
+            'acceptors_sel': '(protein and name O OXT OT1 OT2 OD1 OD2 OE1 OE2 OG OG1 OH ND1 NE2 N) or (nucleic and name O* N*)',
+            'hydrogens_sel': '(protein and name H* HN HT* HXT) or (nucleic and name H*)',
+            'between_pairs': [['protein', 'nucleic']],
+        }
+    if preset == 'protein_ligand':
+        ligand_sel = (
+            'not protein and not nucleic and '
+            'not (resname WAT or resname TIP3 or resname SOL or resname HOH) and '
+            'not (name NA or name CL or name K or name CA or name MG)'
+        )
+        return {
+            'acceptors_sel': f'(protein and name O OXT OT1 OT2 OD1 OD2 OE1 OE2 OG OG1 OH ND1 NE2 N) or ({ligand_sel} and name O* N*)',
+            'hydrogens_sel': f'(protein and name H* HN HT* HXT) or ({ligand_sel} and name H*)',
+            'between_pairs': [['protein', ligand_sel]],
+        }
+    return {
+        'acceptors_sel': None,
+        'hydrogens_sel': None,
+        'between_pairs': None,
+    }
+
+
+def _resolve_hbond_selection_config(hbonds_preset, acceptors_sel, hydrogens_sel, between_pairs):
+    """Merge preset defaults with explicit overrides from configuration."""
+    preset = (hbonds_preset or 'custom').strip().lower()
+    if preset not in VALID_HBOND_PRESETS:
+        raise ValueError(
+            f"Unknown hbonds_preset '{hbonds_preset}'. "
+            f"Accepted values: {', '.join(sorted(VALID_HBOND_PRESETS))}"
+        )
+
+    resolved = _hbond_preset_defaults(preset)
+    if acceptors_sel is not None:
+        resolved['acceptors_sel'] = acceptors_sel
+    if hydrogens_sel is not None:
+        resolved['hydrogens_sel'] = hydrogens_sel
+    if between_pairs is not None:
+        resolved['between_pairs'] = between_pairs
+
+    return preset, resolved['acceptors_sel'], resolved['hydrogens_sel'], resolved['between_pairs']
 
 
 def _is_portable_scalar(value):
@@ -35,7 +101,7 @@ def _to_portable_array(name, value):
 def _build_hbonds_payload(hbonds, *, d_a_cutoff, d_h_a_angle_cutoff,
                           start_frame, update_selections, acceptors_sel,
                           hydrogens_sel, between_pairs, parallel_backend,
-                          n_workers):
+                          n_workers, hbonds_preset='custom'):
     """Build a strict portable dict payload for H-bonds plotting."""
     return {
         'times': _to_portable_array('times', hbonds.times),
@@ -49,9 +115,79 @@ def _build_hbonds_payload(hbonds, *, d_a_cutoff, d_h_a_angle_cutoff,
         'acceptors_sel': acceptors_sel,
         'hydrogens_sel': hydrogens_sel,
         'between_pairs': between_pairs,
+        'hbonds_preset': hbonds_preset,
         'parallel_backend': parallel_backend,
         'n_workers': int(n_workers),
     }
+
+
+def _guess_bonds_if_missing(universe):
+    """Try to infer bonds so donor-hydrogen pairs can be built from topology."""
+    try:
+        universe.atoms.guess_bonds()
+        return True
+    except Exception:
+        return False
+
+
+def _build_hbond_analysis_with_fallback(
+    universe,
+    *,
+    acceptors_sel,
+    hydrogens_sel,
+    between_pairs,
+    d_a_cutoff,
+    d_h_a_angle_cutoff,
+    update_selections,
+):
+    """Create HydrogenBondAnalysis with robust fallbacks for sparse topologies."""
+    kwargs = {
+        'acceptors_sel': acceptors_sel,
+        'hydrogens_sel': hydrogens_sel,
+        'd_a_cutoff': d_a_cutoff,
+        'd_h_a_angle_cutoff': d_h_a_angle_cutoff,
+        'update_selections': update_selections,
+    }
+    if between_pairs is not None:
+        kwargs['between'] = between_pairs
+
+    # First try the default path that relies on topology bonds.
+    try:
+        return hydrogenbonds.HydrogenBondAnalysis(
+            universe,
+            donors_sel=None,
+            **kwargs,
+        )
+    except NoDataError as first_error:
+        # Retry after bond guessing for topologies lacking explicit bonds.
+        if _guess_bonds_if_missing(universe):
+            try:
+                print("INFO: Guessed bonds for H-bond analysis fallback.")
+                return hydrogenbonds.HydrogenBondAnalysis(
+                    universe,
+                    donors_sel=None,
+                    **kwargs,
+                )
+            except NoDataError:
+                pass
+
+        # Final fallback: avoid topology donor-hydrogen mapping and let
+        # MDAnalysis pair hydrogens to explicit donor candidates by distance.
+        if hydrogens_sel:
+            donors_sel = f"not ({hydrogens_sel})"
+            print("INFO: Falling back to distance-based donor matching for H-bonds.")
+            return hydrogenbonds.HydrogenBondAnalysis(
+                universe,
+                donors_sel=donors_sel,
+                **kwargs,
+            )
+
+        raise ValueError(
+            "HydrogenBondAnalysis could not infer donor-hydrogen pairs from this topology. "
+            "Provide explicit --atom-selections (acceptors and hydrogens), optionally together with --between-pairs. "
+            "Underlying error: "
+            f"{first_error}"
+        ) from first_error
 
 # Example selection strings for Hydrogen Bonds analysis:
 #
@@ -67,7 +203,7 @@ def _build_hbonds_payload(hbonds, *, d_a_cutoff, d_h_a_angle_cutoff,
 #   d_a_cutoff = 3.5         # Distance cutoff between donor and acceptor
 #   d_h_a_angle_cutoff = 150 # Angle cutoff for hydrogen bond
 
-def run_hbonds_analysis(systems, variations, num_replicates, d_a_cutoff, d_h_a_angle_cutoff, start_frame, traj_format, top_format='top', acceptors_sel=None, hydrogens_sel=None, between_pairs=None, update_selections=True, wrap_selection='auto', output_dir=None, parallel_backend='serial', n_workers=None, strict_wrapping=False):
+def run_hbonds_analysis(systems, variations, num_replicates, d_a_cutoff, d_h_a_angle_cutoff, start_frame, traj_format, top_format='top', acceptors_sel=None, hydrogens_sel=None, between_pairs=None, update_selections=True, wrap_selection='auto', output_dir=None, parallel_backend='serial', n_workers=None, strict_wrapping=False, wrapped_manifest=None, input_dir=None, require_reference_pdb=False, hbonds_preset='custom'):
     """
     Runs the Hydrogen Bonds analysis for each system and variation and saves results as individual pickle files.
 
@@ -96,6 +232,14 @@ def run_hbonds_analysis(systems, variations, num_replicates, d_a_cutoff, d_h_a_a
 
     print("--- Starting Hydrogen Bonds calculation for each system and variation... ---")
 
+    preset_name, resolved_acceptors_sel, resolved_hydrogens_sel, resolved_between_pairs = _resolve_hbond_selection_config(
+        hbonds_preset,
+        acceptors_sel,
+        hydrogens_sel,
+        between_pairs,
+    )
+    print(f"H-bonds preset: {preset_name}")
+
     reps = range(1, num_replicates + 1)
 
     for system in systems:
@@ -107,16 +251,34 @@ def run_hbonds_analysis(systems, variations, num_replicates, d_a_cutoff, d_h_a_a
                     continue
 
                 print(f"Processing {system}, {variation}, replicate {rep}.")
-                traj_file, _ = resolve_trajectory_file(
-                    system, variation, rep, traj_format
-                )
-                top_file = f'{system}/{variation}/{system}_system_{variation}.{top_format}'
+                if require_reference_pdb:
+                    ref_pdb, _ = resolve_reference_pdb_file(system, variation, base_dir=input_dir)
+                    if not os.path.isfile(ref_pdb):
+                        raise FileNotFoundError(
+                            f"Required reference PDB not found for {system}/{variation}: {ref_pdb}"
+                        )
+
+                wrapped_key = (system, variation, rep)
+                wrapped_traj_file = None
+                if wrapped_manifest:
+                    wrapped_traj_file = wrapped_manifest.get(wrapped_key)
+                    if wrapped_traj_file and not os.path.isfile(wrapped_traj_file):
+                        wrapped_traj_file = None
+
+                if wrapped_traj_file:
+                    traj_file = wrapped_traj_file
+                else:
+                    traj_file, _ = resolve_trajectory_file(
+                        system, variation, rep, traj_format
+                    )
+
+                top_file, _ = resolve_topology_file(system, variation, top_format)
                 u = mda.Universe(top_file, traj_file)
 
                 # PBC handling: wrap_selection controls which atoms
                 # are wrapped back into the primary image.
                 complex_ag, ligand_ag, rest_ag = build_complex_selection(u, wrap_selection=wrap_selection)
-                if complex_ag is not None:
+                if complex_ag is not None and wrapped_traj_file is None:
                     # Keep wrapping serial and run the H-bond analysis on a
                     # clean trajectory without attached transformations so that
                     # parallel backends remain usable.
@@ -124,50 +286,32 @@ def run_hbonds_analysis(systems, variations, num_replicates, d_a_cutoff, d_h_a_a
                                          ligand_selection=ligand_ag,
                                          strict_wrapping=strict_wrapping)
 
-                    wrapped_traj_file = f'wrapped_{system}_production_{variation}_rep{rep}.{traj_format}'
-                    if not os.path.exists(wrapped_traj_file):
-                        print(f"Creating wrapped trajectory (serial pre-processing): {wrapped_traj_file}")
-                        with mda.Writer(wrapped_traj_file, n_atoms=u.atoms.n_atoms) as writer:
+                    wrapped_traj_local = f'wrapped_{system}_production_{variation}_rep{rep}.{traj_format}'
+                    if not os.path.exists(wrapped_traj_local):
+                        print(f"Creating wrapped trajectory (serial pre-processing): {wrapped_traj_local}")
+                        with mda.Writer(wrapped_traj_local, n_atoms=u.atoms.n_atoms) as writer:
                             for _ts in u.trajectory:
                                 writer.write(u.atoms)
 
                     del u
-                    u = mda.Universe(top_file, wrapped_traj_file)
+                    u = mda.Universe(top_file, wrapped_traj_local)
 
-                if acceptors_sel is None and hydrogens_sel is None and between_pairs is None:
+                if resolved_acceptors_sel is None and resolved_hydrogens_sel is None and resolved_between_pairs is None:
                     raise ValueError("You must provide --between-pairs and/or --atom-selections for Hydrogen Bonds analysis.")
 
-                if (acceptors_sel is None) != (hydrogens_sel is None):
+                if (resolved_acceptors_sel is None) != (resolved_hydrogens_sel is None):
                     raise ValueError("--atom-selections requires BOTH acceptors and hydrogens selections.")
 
                 hbonds = None
-                if between_pairs is not None:
-                    try:
-                        hbonds = hydrogenbonds.HydrogenBondAnalysis(
-                            u,
-                            donors_sel=None,
-                            acceptors_sel=acceptors_sel,
-                            hydrogens_sel=hydrogens_sel,
-                            between=between_pairs,
-                            d_a_cutoff=d_a_cutoff,
-                            d_h_a_angle_cutoff=d_h_a_angle_cutoff,
-                            update_selections=update_selections
-                        )
-                    except NoDataError as e:
-                        raise ValueError(
-                            "HydrogenBondAnalysis could not infer charge-based selections from this topology. "
-                            "Provide explicit --atom-selections (acceptors and hydrogens), optionally together with --between-pairs. "
-                            f"Underlying error: {e}"
-                        ) from e
-                elif acceptors_sel is not None and hydrogens_sel is not None:
-                    hbonds = hydrogenbonds.HydrogenBondAnalysis(
+                if resolved_between_pairs is not None or (resolved_acceptors_sel is not None and resolved_hydrogens_sel is not None):
+                    hbonds = _build_hbond_analysis_with_fallback(
                         u,
-                        donors_sel=None,
-                        acceptors_sel=acceptors_sel,
-                        hydrogens_sel=hydrogens_sel,
+                        acceptors_sel=resolved_acceptors_sel,
+                        hydrogens_sel=resolved_hydrogens_sel,
+                        between_pairs=resolved_between_pairs,
                         d_a_cutoff=d_a_cutoff,
                         d_h_a_angle_cutoff=d_h_a_angle_cutoff,
-                        update_selections=update_selections
+                        update_selections=update_selections,
                     )
 
                 if hbonds is None:
@@ -181,11 +325,12 @@ def run_hbonds_analysis(systems, variations, num_replicates, d_a_cutoff, d_h_a_a
                     d_h_a_angle_cutoff=d_h_a_angle_cutoff,
                     start_frame=start_frame,
                     update_selections=update_selections,
-                    acceptors_sel=acceptors_sel,
-                    hydrogens_sel=hydrogens_sel,
-                    between_pairs=between_pairs,
+                    acceptors_sel=resolved_acceptors_sel,
+                    hydrogens_sel=resolved_hydrogens_sel,
+                    between_pairs=resolved_between_pairs,
                     parallel_backend=parallel_cfg.backend,
                     n_workers=run_kwargs.get('n_workers', 1),
+                    hbonds_preset=preset_name,
                 )
 
                 with open(pickle_file, 'wb') as f:

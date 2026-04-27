@@ -290,6 +290,20 @@ def resolve_trajectory_file(system, variation, rep, traj_format, base_dir=None):
     return default_path, candidates
 
 
+def resolve_topology_file(system, variation, top_format, base_dir=None):
+    """Return the expected topology path for a system/variation."""
+    rel_path = f'{system}/{variation}/{system}_system_{variation}.{top_format}'
+    path = os.path.join(base_dir, rel_path) if base_dir else rel_path
+    return path, rel_path
+
+
+def resolve_reference_pdb_file(system, variation, base_dir=None):
+    """Return required reference PDB path for chain metadata."""
+    rel_path = f'{system}/{variation}/{system}_system_{variation}.pdb'
+    path = os.path.join(base_dir, rel_path) if base_dir else rel_path
+    return path, rel_path
+
+
 def cleanup_work_directory(work_dir, preserve_extensions=None, verbose=True):
     """
     Clean up intermediate files in work directory while preserving analysis outputs.

@@ -163,6 +163,93 @@ class TestPlotToggleParsing:
         assert cfg['run_rog'] is False
         assert cfg['plot_rog'] is True
 
+    def test_rmsf_group_selections_none_with_inline_comment(self, tmp_path):
+        """Inline comments after 'none' must not trigger JSON decode errors."""
+        ini = tmp_path / "test_inline_comment.ini"
+        content = (
+            "[systems]\n"
+            "systems = [\"SysA\"]\n"
+            "variations = {\"SysA\": [\"v1\"]}\n"
+            "num_replicates = 1\n"
+            "\n"
+            "[paths]\n"
+            f"input_dir = {tmp_path}\n"
+            f"output_dir = {tmp_path / 'results'}\n"
+            "\n"
+            "[analysis]\n"
+            "run_rmsd = false\n"
+            "run_rmsf = true\n"
+            "\n"
+            "[rmsd]\n"
+            "time_interval_between_frames = none\n"
+            "\n"
+            "[rmsf]\n"
+            "chain_intervals = none\n"
+            "group_selections = none ; e.g., [\"chainid A\", \"chainid B\"]\n"
+        )
+        ini.write_text(content)
+
+        cfg = load_config(str(ini))
+        assert cfg['rmsf_group_selections'] is None
+
+    def test_hbonds_preset_parsed(self, tmp_path):
+        """hbonds_preset should be read from [hbonds] and normalized."""
+        ini = tmp_path / "test_hbonds_preset.ini"
+        content = (
+            "[systems]\n"
+            "systems = [\"SysA\"]\n"
+            "variations = {\"SysA\": [\"v1\"]}\n"
+            "num_replicates = 1\n"
+            "\n"
+            "[paths]\n"
+            f"input_dir = {tmp_path}\n"
+            f"output_dir = {tmp_path / 'results'}\n"
+            "\n"
+            "[analysis]\n"
+            "run_rmsd = false\n"
+            "run_hbonds = true\n"
+            "\n"
+            "[rmsd]\n"
+            "time_interval_between_frames = none\n"
+            "\n"
+            "[hbonds]\n"
+            "hbonds_preset = protein_nucleic\n"
+            "between_pairs = none\n"
+        )
+        ini.write_text(content)
+
+        cfg = load_config(str(ini))
+        assert cfg['hbonds_preset'] == 'protein_nucleic'
+
+    def test_hbonds_preset_none_falls_back_to_custom(self, tmp_path):
+        """hbonds_preset = none should normalize to the default custom preset."""
+        ini = tmp_path / "test_hbonds_preset_none.ini"
+        content = (
+            "[systems]\n"
+            "systems = [\"SysA\"]\n"
+            "variations = {\"SysA\": [\"v1\"]}\n"
+            "num_replicates = 1\n"
+            "\n"
+            "[paths]\n"
+            f"input_dir = {tmp_path}\n"
+            f"output_dir = {tmp_path / 'results'}\n"
+            "\n"
+            "[analysis]\n"
+            "run_rmsd = false\n"
+            "run_hbonds = true\n"
+            "\n"
+            "[rmsd]\n"
+            "time_interval_between_frames = none\n"
+            "\n"
+            "[hbonds]\n"
+            "hbonds_preset = none\n"
+            "between_pairs = none\n"
+        )
+        ini.write_text(content)
+
+        cfg = load_config(str(ini))
+        assert cfg['hbonds_preset'] == 'custom'
+
 
 # ─── validate_plot_pickles ────────────────────────────────────────────────────
 
@@ -289,6 +376,17 @@ class TestTimeUnitConfig:
         ini = _write_ini(tmp_path, "run_rmsd = true")
         cfg = load_config(ini)
         assert cfg['time_interval_between_frames'] == 2.0
+
+    @pytest.mark.parametrize('rmsd_lines, match', [
+        ('time_interval_between_frames = 0', 'greater than zero'),
+        ('time_interval_between_frames = -1', 'greater than zero'),
+        ('time_interval_between_frames = 1e9', 'sanity range'),
+    ])
+    def test_invalid_time_interval_between_frames_raises(self, tmp_path, rmsd_lines, match):
+        """Out-of-range time_interval_between_frames values should fail fast."""
+        ini = _write_ini(tmp_path, "run_rmsd = true", rmsd_lines=rmsd_lines)
+        with pytest.raises(ValueError, match=match):
+            load_config(ini)
 
     def test_hbonds_time_unit_removed(self, tmp_path):
         """cfg should NOT contain 'hbonds_time_unit' anymore."""
@@ -842,4 +940,33 @@ class TestCollectPicklesSubdirs:
         cfg = _make_base_cfg()
         result = _collect_pickles(str(tmp_path), 'rmsd_plot', cfg, analysis_type=None)
         assert len(result) == 1
+
+    def test_ignores_legacy_duplicate_selection_pickle(self, tmp_path):
+        rmsd_dir = tmp_path / 'rmsd'
+        rmsd_dir.mkdir()
+
+        canonical = rmsd_dir / 'rmsd_plot_SysA_v1_rep1.pkl'
+        duplicate = rmsd_dir / 'rmsd_plot_SysA_v1_rep1_sel0.pkl'
+        extra = rmsd_dir / 'rmsd_plot_SysA_v1_rep1_sel1.pkl'
+
+        canonical.write_bytes(pickle.dumps({'selection': 'protein', 'ref_selection': 'protein and backbone'}))
+        duplicate.write_bytes(pickle.dumps({'selection': 'protein', 'ref_selection': 'protein and backbone'}))
+        extra.write_bytes(pickle.dumps({'selection': 'resname T44', 'ref_selection': 'protein and backbone'}))
+
+        cfg = _make_base_cfg()
+        result = _collect_pickles(
+            str(tmp_path),
+            'rmsd_plot',
+            cfg,
+            analysis_type='rmsd',
+            prune_stale_duplicates=True,
+        )
+
+        assert canonical.as_posix() in result
+        assert extra.as_posix() in result
+        assert duplicate.as_posix() not in result
+        assert len(result) == 2
+        assert canonical.exists()
+        assert extra.exists()
+        assert not duplicate.exists()
 

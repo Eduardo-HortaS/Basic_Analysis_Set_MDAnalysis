@@ -13,7 +13,11 @@ import pytest
 from unittest.mock import MagicMock, patch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from run_hbonds_analysis import run_hbonds_analysis, _build_hbonds_payload
+from run_hbonds_analysis import (
+    run_hbonds_analysis,
+    _build_hbonds_payload,
+    _resolve_hbond_selection_config,
+)
 
 
 class _DummyHBonds:
@@ -55,6 +59,7 @@ class TestPortablePayload:
         assert isinstance(payload['count_by_time'], np.ndarray)
         assert isinstance(payload['count_by_type'], np.ndarray)
         assert isinstance(payload['count_by_ids'], np.ndarray)
+        assert payload['hbonds_preset'] == 'custom'
         assert payload['parallel_backend'] == 'serial'
         assert payload['n_workers'] == 1
 
@@ -74,6 +79,27 @@ class TestPortablePayload:
                 between_pairs=[["protein", "nucleic"]],
                 parallel_backend='multiprocessing',
                 n_workers=4,
+            )
+
+
+class TestHBondPresets:
+    def test_explicit_between_pairs_overrides_preset(self):
+        explicit_pairs = [['protein', 'resname LIG']]
+        _preset, _acc, _hyd, pairs = _resolve_hbond_selection_config(
+            'protein_nucleic',
+            acceptors_sel=None,
+            hydrogens_sel=None,
+            between_pairs=explicit_pairs,
+        )
+        assert pairs == explicit_pairs
+
+    def test_invalid_preset_raises(self):
+        with pytest.raises(ValueError, match='Unknown hbonds_preset'):
+            _resolve_hbond_selection_config(
+                'unknown_preset',
+                acceptors_sel=None,
+                hydrogens_sel=None,
+                between_pairs=None,
             )
 
 
@@ -174,6 +200,7 @@ class TestRunHBondsAnalysis:
         dumped = mock_pickle.dump.call_args[0][0]
         assert isinstance(dumped, dict)
         assert {'times', 'count_by_time', 'count_by_type', 'count_by_ids'} <= set(dumped)
+        assert dumped['hbonds_preset'] == 'custom'
 
     @patch('run_hbonds_analysis.transform_trajectory')
     @patch('run_hbonds_analysis.build_complex_selection', return_value=(MagicMock(), MagicMock(), MagicMock()))
@@ -215,3 +242,4 @@ class TestRunHBondsAnalysis:
         assert isinstance(dumped, dict)
         assert dumped['acceptors_sel'] == 'protein and name O*'
         assert dumped['hydrogens_sel'] == 'nucleic and name H*'
+        assert dumped['hbonds_preset'] == 'custom'

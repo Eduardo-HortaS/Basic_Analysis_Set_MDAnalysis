@@ -109,3 +109,21 @@ def format_selection_subtitle(selection_str, max_length=60):
     if len(selection_str) <= max_length:
         return selection_str
     return selection_str[:max_length - 1] + '…'
+
+
+def format_selection_context(target_selection=None, ref_selection=None,
+                             group_selection=None, max_length=120):
+    """Build a compact context line with explicit selection strings."""
+    parts = []
+    if target_selection:
+        parts.append(f"target={target_selection}")
+    if ref_selection:
+        parts.append(f"ref={ref_selection}")
+    if group_selection:
+        parts.append(f"group={group_selection}")
+
+    if not parts:
+        return ''
+
+    context = ' | '.join(parts)
+    return format_selection_subtitle(context, max_length=max_length)

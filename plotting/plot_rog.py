@@ -16,7 +16,15 @@ from scipy.stats import gaussian_kde
 
 import sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from style import apply_style, get_color_cycle, format_label_with_stats, prettify_label, DEFAULT_DPI, DEFAULT_FIGSIZE
+from style import (
+    apply_style,
+    get_color_cycle,
+    format_label_with_stats,
+    format_selection_context,
+    prettify_label,
+    DEFAULT_DPI,
+    DEFAULT_FIGSIZE,
+)
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from utils import time_unit_label
@@ -77,8 +85,9 @@ def plot_rog(pickle_file, output_dir='.', dpi=DEFAULT_DPI, show_kde=True, label=
     ax0.set_xlabel(f'Time ({time_unit_label(time_unit)})', fontsize=14, fontweight='bold')
     ax0.set_ylabel(r'Radius of Gyration ($\AA$)', fontsize=14, fontweight='bold')
     ax0.set_title('Radius of Gyration vs Time', fontsize=16, fontweight='bold', pad=15)
-    if selection:
-        ax0.text(0.5, 1.01, f'Selection: {selection}',
+    context_line = format_selection_context(target_selection=selection)
+    if context_line:
+        ax0.text(0.5, 1.01, f'Selections: {context_line}',
                  transform=ax0.transAxes, fontsize=10, ha='center', va='bottom',
                  style='italic', color='gray')
     ax0.legend(loc='lower right', fontsize=11, frameon=True)

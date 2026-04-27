@@ -5,7 +5,17 @@ import json
 import numpy as np
 import MDAnalysis as mda
 from MDAnalysis.analysis import rms, diffusionmap
-from utils import transform_trajectory, align_trajectory, build_complex_selection, convert_time_from_ps, validate_time_unit, SUPPORTED_TIME_UNITS, resolve_trajectory_file
+from utils import (
+    transform_trajectory,
+    align_trajectory,
+    build_complex_selection,
+    convert_time_from_ps,
+    validate_time_unit,
+    SUPPORTED_TIME_UNITS,
+    resolve_trajectory_file,
+    resolve_topology_file,
+    resolve_reference_pdb_file,
+)
 from parallelization import ParallelConfig, get_run_kwargs, safe_run
 
 # Example selection strings for different RMS* analyses:
@@ -88,10 +98,94 @@ def validate_chain_intervals(universe, chain_intervals, target_selection):
               f"from target selection are not covered by any chain interval.")
 
 
+def _load_reference_chain_metadata(system, variation, input_dir=None):
+    """Load chain metadata from required reference PDB file."""
+    ref_pdb, _ = resolve_reference_pdb_file(system, variation, base_dir=input_dir)
+    if not os.path.isfile(ref_pdb):
+        raise FileNotFoundError(
+            f"Required reference PDB not found for {system}/{variation}: {ref_pdb}"
+        )
+
+    ref_u = mda.Universe(ref_pdb)
+    chain_attr = getattr(ref_u.atoms, 'chainIDs', None)
+    if chain_attr is None:
+        chain_attr = getattr(ref_u.atoms, 'chainids', None)
+
+    chain_ids = []
+    if chain_attr is not None:
+        chain_ids = sorted({str(c).strip() for c in chain_attr if str(c).strip()})
+
+    intervals = {}
+    for chain_id in chain_ids:
+        chain_atoms = ref_u.select_atoms(f'chainid {chain_id}')
+        if len(chain_atoms) == 0:
+            continue
+        resids = chain_atoms.residues.resids
+        intervals[chain_id] = [int(np.min(resids)), int(np.max(resids))]
+
+    return {
+        'path': ref_pdb,
+        'chain_ids': chain_ids,
+        'chain_intervals': intervals,
+    }
+
+
+def _selection_has_atoms(atom_group):
+    """Return True when a selection has at least one atom.
+
+    Some test doubles do not implement ``__len__`` but are iterable; this
+    helper keeps runtime behavior strict while remaining mock-friendly.
+    """
+    try:
+        if len(atom_group) > 0:
+            return True
+    except Exception:
+        pass
+
+    try:
+        resids = atom_group.residues.resids
+        if isinstance(resids, np.ndarray):
+            return resids.size > 0
+        if isinstance(resids, (list, tuple)):
+            return len(resids) > 0
+    except Exception:
+        pass
+
+    try:
+        n_atoms = getattr(atom_group, 'n_atoms')
+        if isinstance(n_atoms, (int, np.integer, float)):
+            return int(n_atoms) > 0
+    except Exception:
+        return False
+
+    return False
+
+
+def _build_unique_selections(target_selection, group_selections, analysis_name):
+    """Return ordered unique selections (target first) with duplicate warnings."""
+    selections = [target_selection]
+    if group_selections:
+        selections.extend(group_selections)
+
+    unique = []
+    seen = set()
+    for sel in selections:
+        key = str(sel).strip()
+        if key in seen:
+            print(
+                f"  NOTE: Duplicate {analysis_name} selection ignored: '{key}'"
+            )
+            continue
+        seen.add(key)
+        unique.append(key)
+    return unique
+
+
 def run_rms_analysis(systems, variations, num_replicates, analysis, target_selection, ref_selection,
                      start_frame, traj_format, top_format='top', group_selections=None, chain_intervals=None,
                      time_interval_between_frames=None, time_unit='ns', ref_suffix='', wrap_selection='auto',
-                     output_dir=None, parallel_backend='serial', n_workers=None, strict_wrapping=False):
+                     output_dir=None, parallel_backend='serial', n_workers=None, strict_wrapping=False,
+                     wrapped_manifest=None, input_dir=None, require_reference_pdb=False):
     """
     After external transforming and aligning of trajectory data for each analysis, system, variation and replicate,
     runs the respective analysis (RMSD (2D and conventional) | RMSF) and saves results as individual pickle files.
@@ -170,8 +264,22 @@ def run_rms_analysis(systems, variations, num_replicates, analysis, target_selec
         '2D-RMSD': '2d_rmsd_plot'
     }
 
+    reference_cache = {}
+
     for system in systems:
         for variation in variations[system]:
+            cache_key = (system, variation)
+            if cache_key not in reference_cache and require_reference_pdb:
+                reference_cache[cache_key] = _load_reference_chain_metadata(
+                    system,
+                    variation,
+                    input_dir=input_dir,
+                )
+                print(
+                    f"  Reference PDB for {system}/{variation}: "
+                    f"{reference_cache[cache_key]['path']}"
+                )
+
             for rep in reps:
                 # Resolve per-system chain intervals
                 system_chain_intervals = None
@@ -203,11 +311,21 @@ def run_rms_analysis(systems, variations, num_replicates, analysis, target_selec
                         continue
 
                 print(f"Processing {system}, {variation}, replicate {rep}.")
-                traj_file, _ = resolve_trajectory_file(
-                    system, variation, rep, traj_format
-                )
+                wrapped_key = (system, variation, rep)
+                wrapped_traj_file = None
+                if wrapped_manifest:
+                    wrapped_traj_file = wrapped_manifest.get(wrapped_key)
+                    if wrapped_traj_file and not os.path.isfile(wrapped_traj_file):
+                        wrapped_traj_file = None
+
+                if wrapped_traj_file:
+                    traj_file = wrapped_traj_file
+                else:
+                    traj_file, _ = resolve_trajectory_file(
+                        system, variation, rep, traj_format
+                    )
                 aligned_traj_file = f'rmsfit_{system}_production_{variation}_reduced_rep{rep}.{traj_format}'
-                top_file = f'{system}/{variation}/{system}_system_{variation}.{top_format}'
+                top_file, _ = resolve_topology_file(system, variation, top_format)
 
                 if analysis == 'RMSD':
                     u = mda.Universe(top_file, traj_file)
@@ -218,7 +336,7 @@ def run_rms_analysis(systems, variations, num_replicates, analysis, target_selec
                     # primary image (default: everything non-protein).
                     complex_ag, ligand_ag, rest_ag = build_complex_selection(
                         u, wrap_selection=wrap_selection)
-                    if complex_ag is not None:
+                    if complex_ag is not None and wrapped_traj_file is None:
                         # Keep wrapping as a serial pre-processing step and
                         # run RMSD on a clean trajectory (no attached
                         # transformations), so MDAnalysis parallel backends can
@@ -226,25 +344,25 @@ def run_rms_analysis(systems, variations, num_replicates, analysis, target_selec
                         transform_trajectory(u, complex_ag, rest_ag,
                                              ligand_selection=ligand_ag)
 
-                        wrapped_traj_file = f'wrapped_{system}_production_{variation}_rep{rep}.{traj_format}'
-                        if not os.path.exists(wrapped_traj_file):
-                            print(f"Creating wrapped trajectory (serial pre-processing): {wrapped_traj_file}")
-                            with mda.Writer(wrapped_traj_file, n_atoms=u.atoms.n_atoms) as writer:
+                        wrapped_traj_local = f'wrapped_{system}_production_{variation}_rep{rep}.{traj_format}'
+                        if not os.path.exists(wrapped_traj_local):
+                            print(f"Creating wrapped trajectory (serial pre-processing): {wrapped_traj_local}")
+                            with mda.Writer(wrapped_traj_local, n_atoms=u.atoms.n_atoms) as writer:
                                 for _ts in u.trajectory:
                                     writer.write(u.atoms)
 
                         del u
-                        u = mda.Universe(top_file, wrapped_traj_file)
+                        u = mda.Universe(top_file, wrapped_traj_local)
 
                     # Build selection list with target_selection always first.
                     # This guarantees the canonical base pickle
                     # rmsd_plot_*_repX.pkl is always produced for Nextflow,
                     # while optional group selections are emitted as extras.
-                    rmsd_selections = [target_selection]
-                    if group_selections:
-                        for gs in group_selections:
-                            if gs != target_selection:
-                                rmsd_selections.append(gs)
+                    rmsd_selections = _build_unique_selections(
+                        target_selection,
+                        group_selections,
+                        analysis_name='RMSD',
+                    )
 
                     for sel_idx, sel_string in enumerate(rmsd_selections):
                         # Determine pickle filename.
@@ -265,7 +383,7 @@ def run_rms_analysis(systems, variations, num_replicates, analysis, target_selec
                         except Exception as e:
                             print(f"WARNING: Selection '{sel_string}' raised an error for {system}/{variation} rep {rep}: {e} — skipping this selection.")
                             continue
-                        if len(sel_atoms) == 0:
+                        if not _selection_has_atoms(sel_atoms):
                             print(f"WARNING: Selection '{sel_string}' matched 0 atoms in {system}/{variation} rep {rep} — skipping this selection.")
                             continue
 
@@ -294,6 +412,8 @@ def run_rms_analysis(systems, variations, num_replicates, analysis, target_selec
                                 rmsd_raw[:, 0], rmsd_raw[:, 1], rmsd_raw[:, 3]
                             ])
 
+                        time_length = None
+
                         # DCD time-axis correction: recalculate time column when DCD format is used
                         if traj_format.lower() == 'dcd' and time_interval_between_frames is not None:
                             print(f"Applying DCD time-axis correction (dt={time_interval_between_frames} ps, output unit={time_unit})...")
@@ -303,6 +423,8 @@ def run_rms_analysis(systems, variations, num_replicates, analysis, target_selec
                             corrected_time = frame_numbers * time_interval_between_frames  # time in ps
                             corrected_time = convert_time_from_ps(corrected_time, time_unit)
                             rmsd_data[:, 1] = corrected_time
+                            if len(corrected_time) > 0:
+                                time_length = float(corrected_time[-1] - corrected_time[0])
 
                         # Store portable data (arrays + metadata) to avoid
                         # pickling MDAnalysis runtime objects tied to local
@@ -312,6 +434,7 @@ def run_rms_analysis(systems, variations, num_replicates, analysis, target_selec
                             'time_corrected': time_interval_between_frames is not None and traj_format.lower() == 'dcd',
                             'time_unit': time_unit if (time_interval_between_frames is not None and traj_format.lower() == 'dcd') else 'ps',
                             'time_interval_between_frames': time_interval_between_frames,
+                            'time_length': time_length,
                             'selection': sel_string,
                             'ref_selection': ref_selection,
                         }
@@ -349,7 +472,7 @@ def run_rms_analysis(systems, variations, num_replicates, analysis, target_selec
                         # aligned trajectory.
                         pre_complex_ag, pre_ligand_ag, pre_rest_ag = build_complex_selection(
                             u, wrap_selection=wrap_selection)
-                        if pre_complex_ag is not None:
+                        if pre_complex_ag is not None and wrapped_traj_file is None:
                             transform_trajectory(u, pre_complex_ag, pre_rest_ag,
                                                  ligand_selection=pre_ligand_ag,
                                                  strict_wrapping=strict_wrapping)
@@ -373,11 +496,11 @@ def run_rms_analysis(systems, variations, num_replicates, analysis, target_selec
                         # Build selection list with target_selection always first.
                         # This guarantees the canonical base pickle is always produced,
                         # while optional group selections are emitted as extras.
-                        rmsf_selections = [target_selection]
-                        if group_selections:
-                            for gs in group_selections:
-                                if gs != target_selection:
-                                    rmsf_selections.append(gs)
+                        rmsf_selections = _build_unique_selections(
+                            target_selection,
+                            group_selections,
+                            analysis_name='RMSF',
+                        )
 
                         for sel_idx, sel_string in enumerate(rmsf_selections):
                             # Determine pickle filename.
@@ -394,9 +517,6 @@ def run_rms_analysis(systems, variations, num_replicates, analysis, target_selec
                             except Exception as e:
                                 print(f"WARNING: Selection '{sel_string}' raised an error for {system}/{variation} rep {rep}: {e} — skipping this selection.")
                                 continue
-                            if len(sel_atoms) == 0:
-                                print(f"WARNING: Selection '{sel_string}' matched 0 atoms in {system}/{variation} rep {rep} — skipping this selection.")
-                                continue
 
                             # Compute RMSF for this selection
                             rmsf_atoms = sel_atoms
@@ -407,6 +527,9 @@ def run_rms_analysis(systems, variations, num_replicates, analysis, target_selec
                             # residue — this is the standard for publication plots.
                             rmsf_values_atoms = to_run_rmsf.results.rmsf
                             atom_resids = np.array([atom.resid for atom in rmsf_atoms])
+                            if atom_resids.size == 0:
+                                print(f"WARNING: Selection '{sel_string}' matched 0 atoms in {system}/{variation} rep {rep} — skipping this selection.")
+                                continue
 
                             def _per_residue_rmsf(resid_list):
                                 """Average atom-level RMSF for each residue in *resid_list*."""
@@ -426,6 +549,15 @@ def run_rms_analysis(systems, variations, num_replicates, analysis, target_selec
                             # per-selection RMSF directly avoids interval/selection
                             # mismatches.
                             if system_chain_intervals is not None and sel_idx == 0:
+                                ref_meta = reference_cache.get((system, variation), {'chain_ids': []})
+                                ref_chain_ids = set(ref_meta['chain_ids'])
+                                missing_chain_ids = [cid for cid in system_chain_intervals.keys() if cid not in ref_chain_ids]
+                                if ref_chain_ids and missing_chain_ids:
+                                    raise ValueError(
+                                        f"RMSF chain_intervals for {system}/{variation} contain unknown chains "
+                                        f"{missing_chain_ids}. Reference chains from PDB are {sorted(ref_chain_ids)}."
+                                    )
+
                                 # Validate chain intervals against the trajectory
                                 validate_chain_intervals(u, system_chain_intervals, sel_string)
 
@@ -442,6 +574,7 @@ def run_rms_analysis(systems, variations, num_replicates, analysis, target_selec
                                         'chain_id': chain_id,
                                         'original_resids': chain_original_resids,
                                         'selection': sel_string,
+                                        'ref_selection': ref_selection,
                                     }
 
                                     if sel_idx == 0:
@@ -463,6 +596,7 @@ def run_rms_analysis(systems, variations, num_replicates, analysis, target_selec
                                     'chain_id': '',
                                     'original_resids': full_resids,
                                     'selection': sel_string,
+                                    'ref_selection': ref_selection,
                                 }
 
                                 pkl_path = _pkl(pkl_name_template)
@@ -476,6 +610,7 @@ def run_rms_analysis(systems, variations, num_replicates, analysis, target_selec
                         matrix_result = {
                             'dist_matrix': np.asarray(matrix_2d_rmsd.results.dist_matrix),
                             'selection': target_selection,
+                            'ref_selection': ref_selection,
                         }
 
                         with open(_pkl(f'{analysis_file_prefix[analysis]}_{system}_{variation}_rep{rep}.pkl'), 'wb') as f:

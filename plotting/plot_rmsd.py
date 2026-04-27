@@ -17,7 +17,8 @@ from scipy.stats import gaussian_kde
 import sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from style import (apply_style, get_color_cycle, format_label_with_stats,
-                   format_selection_subtitle, prettify_label, DEFAULT_DPI, DEFAULT_FIGSIZE)
+                   format_selection_subtitle, format_selection_context,
+                   prettify_label, DEFAULT_DPI, DEFAULT_FIGSIZE)
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from utils import time_unit_label
@@ -44,6 +45,8 @@ def plot_rmsd(pickle_file, output_dir='.', dpi=DEFAULT_DPI, show_kde=True, label
         data = pickle.load(f)
 
     # Handle both portable dict schema and legacy object-based schemas.
+    selection = ''
+    ref_selection = ''
     if isinstance(data, dict):
         if 'rmsd_data' in data:
             rmsd_data = np.asarray(data['rmsd_data'])
@@ -53,6 +56,8 @@ def plot_rmsd(pickle_file, output_dir='.', dpi=DEFAULT_DPI, show_kde=True, label
             raise ValueError("Invalid RMSD pickle schema: expected 'rmsd_data' key")
         time_corrected = data.get('time_corrected', False)
         time_unit = data.get('time_unit', 'ps')
+        selection = data.get('selection', '')
+        ref_selection = data.get('ref_selection', '')
     else:
         rmsd_obj = data
         rmsd_data = rmsd_obj.results.rmsd
@@ -86,6 +91,21 @@ def plot_rmsd(pickle_file, output_dir='.', dpi=DEFAULT_DPI, show_kde=True, label
     ax0.set_xlabel(time_label, fontsize=14, fontweight='bold')
     ax0.set_ylabel(r'RMSD ($\AA$)', fontsize=14, fontweight='bold')
     ax0.set_title('RMSD vs Time', fontsize=16, fontweight='bold', pad=15)
+    context_line = format_selection_context(
+        target_selection=selection,
+        ref_selection=ref_selection,
+    )
+    if context_line:
+        ax0.text(
+            0.5, 1.01,
+            f'Selections: {context_line}',
+            transform=ax0.transAxes,
+            fontsize=10,
+            ha='center',
+            va='bottom',
+            style='italic',
+            color='gray',
+        )
     ax0.legend(loc='lower right', fontsize=11, frameon=True)
     apply_style(ax0)
 
@@ -188,7 +208,7 @@ def plot_rmsd_comparison(pickle_files, labels, group_name, output_dir='.',
     ax0.set_title(title, fontsize=16, fontweight='bold', pad=15)
 
     if selection_label:
-        ax0.text(0.5, 1.01, f'Selection: {format_selection_subtitle(selection_label)}',
+        ax0.text(0.5, 1.01, f'Selections: {format_selection_subtitle(selection_label, max_length=120)}',
                  transform=ax0.transAxes, fontsize=10, ha='center', va='bottom',
                  style='italic', color='gray')
 
@@ -302,7 +322,7 @@ def plot_rmsd_comparison_average(pickle_groups, labels, group_name, output_dir='
     ax0.set_title(title, fontsize=16, fontweight='bold', pad=15)
 
     if selection_label:
-        ax0.text(0.5, 1.01, f'Selection: {format_selection_subtitle(selection_label)}',
+        ax0.text(0.5, 1.01, f'Selections: {format_selection_subtitle(selection_label, max_length=120)}',
                  transform=ax0.transAxes, fontsize=10, ha='center', va='bottom',
                  style='italic', color='gray')
 

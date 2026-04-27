@@ -5,7 +5,16 @@ import argparse
 import json
 import MDAnalysis as mda
 import numpy as np
-from utils import transform_trajectory, build_complex_selection, convert_time_from_ps, validate_time_unit, SUPPORTED_TIME_UNITS, resolve_trajectory_file
+from utils import (
+    transform_trajectory,
+    build_complex_selection,
+    convert_time_from_ps,
+    validate_time_unit,
+    SUPPORTED_TIME_UNITS,
+    resolve_trajectory_file,
+    resolve_topology_file,
+    resolve_reference_pdb_file,
+)
 
 # Make the module importable under its own name even when run as ``__main__``.
 # This is required so that ``pickle`` can resolve ``RoGResults`` when the script
@@ -33,7 +42,7 @@ RoGResults.__module__ = 'run_rog_analysis'
 #   selection = 'protein'              # All protein atoms
 #   selection = 'nucleic'              # All nucleic acid atoms
 
-def run_rog_analysis(systems, variations, num_replicates, start_frame, traj_format, top_format='top', selection='protein and backbone', time_unit='ns', wrap_selection='auto', output_dir=None, strict_wrapping=False):
+def run_rog_analysis(systems, variations, num_replicates, start_frame, traj_format, top_format='top', selection='protein and backbone', time_unit='ns', wrap_selection='auto', output_dir=None, strict_wrapping=False, wrapped_manifest=None, input_dir=None, require_reference_pdb=False):
     """
     Runs the Radius of Gyration analysis for each system and variation and saves results as individual pickle files.
 
@@ -71,17 +80,34 @@ def run_rog_analysis(systems, variations, num_replicates, start_frame, traj_form
                     continue
 
                 print(f"Processing {system}, {variation}, replicate {rep}.")
-                traj_file, _ = resolve_trajectory_file(
-                    system, variation, rep, traj_format
-                )
-                top_file = f'{system}/{variation}/{system}_system_{variation}.{top_format}'
+                if require_reference_pdb:
+                    ref_pdb, _ = resolve_reference_pdb_file(system, variation, base_dir=input_dir)
+                    if not os.path.isfile(ref_pdb):
+                        raise FileNotFoundError(
+                            f"Required reference PDB not found for {system}/{variation}: {ref_pdb}"
+                        )
 
+                wrapped_key = (system, variation, rep)
+                wrapped_traj_file = None
+                if wrapped_manifest:
+                    wrapped_traj_file = wrapped_manifest.get(wrapped_key)
+                    if wrapped_traj_file and not os.path.isfile(wrapped_traj_file):
+                        wrapped_traj_file = None
+
+                if wrapped_traj_file:
+                    traj_file = wrapped_traj_file
+                else:
+                    traj_file, _ = resolve_trajectory_file(
+                        system, variation, rep, traj_format
+                    )
+
+                top_file, _ = resolve_topology_file(system, variation, top_format)
                 u = mda.Universe(top_file, traj_file)
 
                 # PBC handling: wrap_selection controls which atoms
                 # are wrapped back into the primary image.
                 complex_ag, ligand_ag, rest_ag = build_complex_selection(u, wrap_selection=wrap_selection)
-                if complex_ag is not None:
+                if complex_ag is not None and wrapped_traj_file is None:
                     transform_trajectory(u, complex_ag, rest_ag,
                                          ligand_selection=ligand_ag,
                                          strict_wrapping=strict_wrapping)

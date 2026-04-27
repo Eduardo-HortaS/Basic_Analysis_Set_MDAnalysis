@@ -76,18 +76,21 @@ params_*.yml
 docs/
 
 # Local validation reports (root-generated)
-/parity_report*.md
-/parallel_comparison*.md
+*.md
+README.md
+
+# tests 
+.test_results
+
 
 # Local run configs
-*nucleolin.ini
-*nucleolin.config
 /*.ini
 !/pytest.ini
 inis/*.ini
 !inis/example_pipeline.ini
 !inis/test_comparison.ini
 !inis/test_plot_groups.ini
+
 
 # Machine-specific Nextflow params
 yml_nf/*.yml

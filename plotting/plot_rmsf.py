@@ -15,7 +15,8 @@ import matplotlib.pyplot as plt
 import sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from style import (apply_style, get_color_cycle, format_label_with_stats,
-                   format_selection_subtitle, prettify_label, DEFAULT_DPI, DEFAULT_FIGSIZE)
+                   format_selection_subtitle, format_selection_context,
+                   prettify_label, DEFAULT_DPI, DEFAULT_FIGSIZE)
 
 
 def plot_rmsf(pickle_file, output_dir='.', dpi=DEFAULT_DPI, plot_type='line', label=None):
@@ -39,12 +40,16 @@ def plot_rmsf(pickle_file, output_dir='.', dpi=DEFAULT_DPI, plot_type='line', la
         data = pickle.load(f)
 
     # Handle chain-split (dict) vs. full RMSF (rms.RMSF object) pickles
+    selection = ''
+    ref_selection = ''
     if isinstance(data, dict) and 'rmsf' in data:
         # Chain-split pickle
         rmsf_values = data['rmsf']
         resids = data['resids']
         chain_id = data.get('chain_id', '')
         original_resids = data.get('original_resids', resids)
+        selection = data.get('selection', '')
+        ref_selection = data.get('ref_selection', '')
         if label is None:
             label = f"Chain {chain_id}" if chain_id else os.path.basename(pickle_file)
         title_suffix = f" - Chain {chain_id}" if chain_id else ""
@@ -76,6 +81,14 @@ def plot_rmsf(pickle_file, output_dir='.', dpi=DEFAULT_DPI, plot_type='line', la
     ax.set_xlabel('Residue Number', fontsize=14, fontweight='bold')
     ax.set_ylabel(r'RMSF ($\AA$)', fontsize=14, fontweight='bold')
     ax.set_title(f'RMSF per Residue{title_suffix}', fontsize=16, fontweight='bold', pad=15)
+    context_line = format_selection_context(
+        target_selection=selection,
+        ref_selection=ref_selection,
+    )
+    if context_line:
+        ax.text(0.5, 1.01, f'Selections: {context_line}',
+                transform=ax.transAxes, fontsize=10, ha='center', va='bottom',
+                style='italic', color='gray')
     ax.legend(loc='upper right', fontsize=11, frameon=True)
     apply_style(ax)
 
@@ -88,7 +101,7 @@ def plot_rmsf(pickle_file, output_dir='.', dpi=DEFAULT_DPI, plot_type='line', la
 
 
 def _load_rmsf_pickle(pickle_file):
-    """Load an RMSF pickle file and return (resids, rmsf_values, chain_id)."""
+    """Load an RMSF pickle file and return data plus selection metadata."""
     with open(pickle_file, 'rb') as f:
         data = pickle.load(f)
 
@@ -96,12 +109,16 @@ def _load_rmsf_pickle(pickle_file):
         rmsf_values = data['rmsf']
         resids = data['resids']
         chain_id = data.get('chain_id', '')
+        selection = data.get('selection', '')
+        ref_selection = data.get('ref_selection', '')
     else:
         rmsf_values = data.results.rmsf
         resids = np.arange(1, len(rmsf_values) + 1)
         chain_id = ''
+        selection = ''
+        ref_selection = ''
 
-    return resids, rmsf_values, chain_id
+    return resids, rmsf_values, chain_id, selection, ref_selection
 
 
 def plot_rmsf_comparison(pickle_files, labels, group_name, output_dir='.',
@@ -132,10 +149,16 @@ def plot_rmsf_comparison(pickle_files, labels, group_name, output_dir='.',
     fig, ax = plt.subplots(figsize=DEFAULT_FIGSIZE)
 
     chain_id_for_title = ''
+    plot_selection = ''
+    plot_ref_selection = ''
     for i, (pkl, lbl) in enumerate(zip(pickle_files, labels)):
-        resids, rmsf_values, chain_id = _load_rmsf_pickle(pkl)
+        resids, rmsf_values, chain_id, selection, ref_selection = _load_rmsf_pickle(pkl)
         if chain_id:
             chain_id_for_title = chain_id
+        if not plot_selection:
+            plot_selection = selection
+        if not plot_ref_selection:
+            plot_ref_selection = ref_selection
         color = colors[i]
         plot_label = format_label_with_stats(lbl, rmsf_values)
 
@@ -150,8 +173,12 @@ def plot_rmsf_comparison(pickle_files, labels, group_name, output_dir='.',
     title = f'RMSF per Residue \u2014 {prettify_label(group_name)}{title_suffix}'
     ax.set_title(title, fontsize=16, fontweight='bold', pad=15)
 
-    if selection_label:
-        ax.text(0.5, 1.01, f'Selection: {format_selection_subtitle(selection_label)}',
+    context_line = format_selection_context(
+        target_selection=plot_selection or selection_label,
+        ref_selection=plot_ref_selection,
+    )
+    if context_line:
+        ax.text(0.5, 1.01, f'Selections: {format_selection_subtitle(context_line, max_length=120)}',
                 transform=ax.transAxes, fontsize=10, ha='center', va='bottom',
                 style='italic', color='gray')
 
@@ -193,13 +220,19 @@ def plot_rmsf_comparison_average(pickle_groups, labels, group_name, output_dir='
     fig, ax = plt.subplots(figsize=DEFAULT_FIGSIZE)
 
     chain_id_for_title = ''
+    plot_selection = ''
+    plot_ref_selection = ''
     for i, (pkl_list, lbl) in enumerate(zip(pickle_groups, labels)):
         all_rmsf = []
         all_resids = None
         for pkl in pkl_list:
-            resids, rmsf_values, chain_id = _load_rmsf_pickle(pkl)
+            resids, rmsf_values, chain_id, selection, ref_selection = _load_rmsf_pickle(pkl)
             if chain_id:
                 chain_id_for_title = chain_id
+            if not plot_selection:
+                plot_selection = selection
+            if not plot_ref_selection:
+                plot_ref_selection = ref_selection
             all_rmsf.append(rmsf_values)
             if all_resids is None:
                 all_resids = resids
@@ -226,8 +259,12 @@ def plot_rmsf_comparison_average(pickle_groups, labels, group_name, output_dir='
     title = f'RMSF per Residue \u2014 {prettify_label(group_name)} (averaged){title_suffix}'
     ax.set_title(title, fontsize=16, fontweight='bold', pad=15)
 
-    if selection_label:
-        ax.text(0.5, 1.01, f'Selection: {format_selection_subtitle(selection_label)}',
+    context_line = format_selection_context(
+        target_selection=plot_selection or selection_label,
+        ref_selection=plot_ref_selection,
+    )
+    if context_line:
+        ax.text(0.5, 1.01, f'Selections: {format_selection_subtitle(context_line, max_length=120)}',
                 transform=ax.transAxes, fontsize=10, ha='center', va='bottom',
                 style='italic', color='gray')
 

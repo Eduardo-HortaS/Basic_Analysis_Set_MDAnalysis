@@ -138,6 +138,7 @@ class TestRunRmsAnalysisRMSD:
         assert captured_data['time_corrected'] is True
         assert captured_data['time_unit'] == 'ns'
         assert captured_data['time_interval_between_frames'] == 2.0
+        assert captured_data['time_length'] == pytest.approx(0.018)
 
     @patch('run_rms_analysis.transform_trajectory')
     @patch('run_rms_analysis.mda')
@@ -179,6 +180,7 @@ class TestRunRmsAnalysisRMSD:
         # frame * 2.0 ps / 1000 = ns
         expected_times = frames * 2.0 / 1000.0
         np.testing.assert_array_almost_equal(rmsd_array[:, 1], expected_times)
+        assert mock_rmsd_result.results.rmsd is rmsd_array
 
     @patch('run_rms_analysis.transform_trajectory')
     @patch('run_rms_analysis.mda')
@@ -649,16 +651,18 @@ class TestGroupSelections:
                 time_interval_between_frames=2.0, time_unit='ns'
             )
 
+        base = tmp_path / 'rmsd_plot_sys1_wild_rep1.pkl'
         sel0 = tmp_path / 'rmsd_plot_sys1_wild_rep1_sel0.pkl'
         sel1 = tmp_path / 'rmsd_plot_sys1_wild_rep1_sel1.pkl'
+        assert base.exists(), "Canonical target-selection pickle should exist"
         assert sel0.exists(), "Selection 0 pickle should exist"
-        assert sel1.exists(), "Selection 1 pickle should exist"
+        assert not sel1.exists(), "Duplicate target selection should be deduplicated"
 
         # Verify selection key from captured data
+        base_data = captured['rmsd_plot_sys1_wild_rep1.pkl']
         sel0_data = captured['rmsd_plot_sys1_wild_rep1_sel0.pkl']
-        sel1_data = captured['rmsd_plot_sys1_wild_rep1_sel1.pkl']
-        assert sel0_data['selection'] == 'protein and backbone'
-        assert sel1_data['selection'] == 'nucleic'
+        assert base_data['selection'] == 'protein and backbone'
+        assert sel0_data['selection'] == 'nucleic'
 
     @patch('run_rms_analysis.transform_trajectory')
     @patch('run_rms_analysis.mda')

@@ -247,6 +247,7 @@ def mock_hbonds_pickle(tmp_path):
         'acceptors_sel': 'protein and name O*',
         'hydrogens_sel': 'nucleic and name H*',
         'between_pairs': None,
+        'hbonds_preset': 'custom',
         'parallel_backend': 'serial',
         'n_workers': 1,
     }

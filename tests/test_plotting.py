@@ -280,6 +280,24 @@ class TestPlotHBonds:
         pngs = [f for f in os.listdir(output_dir) if f.endswith('.png')]
         assert len(pngs) == 1
 
+    def test_hbonds_uses_preset_label(self, mock_hbonds_pickle, tmp_path, monkeypatch):
+        """plot_hbonds should label plots with the preset, not atom selections."""
+        from plotting import plot_hbonds as mod
+
+        captured = {}
+
+        def _capture(times, counts, output_path, dpi=mod.DEFAULT_DPI, time_unit='ps', label=''):
+            captured['label'] = label
+
+        monkeypatch.setattr(mod, 'plot_hbonds_by_time', _capture)
+        monkeypatch.setattr(mod, 'plot_hbonds_by_type', lambda *args, **kwargs: None)
+        monkeypatch.setattr(mod, 'plot_hbonds_by_ids', lambda *args, **kwargs: None)
+
+        mod.plot_hbonds(mock_hbonds_pickle, output_dir=str(tmp_path / 'out'), dpi=72, plot_types=['time'])
+
+        assert 'custom' in captured['label'].lower()
+        assert 'protein and name' not in captured['label'].lower()
+
     def test_hbonds_legacy_schema_raises(self, tmp_path):
         """Legacy non-dict H-bonds pickles should raise a schema error."""
         from plotting.plot_hbonds import plot_hbonds

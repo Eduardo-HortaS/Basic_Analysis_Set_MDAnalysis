@@ -13,6 +13,7 @@ import matplotlib.pyplot as plt
 import sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from style import DEFAULT_DPI, prettify_label
+from style import format_selection_context
 
 
 def plot_2d_rmsd(pickle_file, output_dir='.', dpi=DEFAULT_DPI, cmap='viridis', label=None):
@@ -35,10 +36,14 @@ def plot_2d_rmsd(pickle_file, output_dir='.', dpi=DEFAULT_DPI, cmap='viridis', l
     with open(pickle_file, 'rb') as f:
         data = pickle.load(f)
 
+    selection = ''
+    ref_selection = ''
     if isinstance(data, dict):
         if 'dist_matrix' not in data:
             raise ValueError("Invalid 2D-RMSD pickle schema: expected 'dist_matrix' key")
         dist_matrix = np.asarray(data['dist_matrix'])
+        selection = data.get('selection', '')
+        ref_selection = data.get('ref_selection', '')
     else:
         dist_matrix = data.results.dist_matrix
 
@@ -55,6 +60,22 @@ def plot_2d_rmsd(pickle_file, output_dir='.', dpi=DEFAULT_DPI, cmap='viridis', l
     ax.set_xlabel('Frame', fontsize=14, fontweight='bold')
     ax.set_ylabel('Frame', fontsize=14, fontweight='bold')
     ax.set_title(f'2D-RMSD Distance Matrix\n{label}', fontsize=16, fontweight='bold', pad=15)
+    context_line = format_selection_context(
+        target_selection=selection,
+        ref_selection=ref_selection,
+    )
+    if context_line:
+        ax.text(
+            0.5,
+            1.01,
+            f'Selections: {context_line}',
+            transform=ax.transAxes,
+            fontsize=10,
+            ha='center',
+            va='bottom',
+            style='italic',
+            color='gray',
+        )
     ax.tick_params(axis='both', labelsize=12)
 
     os.makedirs(output_dir, exist_ok=True)
