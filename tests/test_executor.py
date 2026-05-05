@@ -970,3 +970,31 @@ class TestCollectPicklesSubdirs:
         assert extra.exists()
         assert not duplicate.exists()
 
+    def test_keeps_distinct_system_pickles_with_same_selection(self, tmp_path):
+        rmsd_dir = tmp_path / 'rmsd'
+        rmsd_dir.mkdir()
+
+        sysa = rmsd_dir / 'rmsd_plot_SysA_v1_rep1.pkl'
+        sysb = rmsd_dir / 'rmsd_plot_SysB_v1_rep1.pkl'
+
+        payload = {'selection': 'protein and backbone', 'ref_selection': 'protein and backbone'}
+        sysa.write_bytes(pickle.dumps(payload))
+        sysb.write_bytes(pickle.dumps(payload))
+
+        cfg = _make_base_cfg(
+            systems=['SysA', 'SysB'],
+            variations={'SysA': ['v1'], 'SysB': ['v1']},
+            num_replicates=1,
+        )
+        result = _collect_pickles(
+            str(tmp_path),
+            'rmsd_plot',
+            cfg,
+            analysis_type='rmsd',
+            prune_stale_duplicates=False,
+        )
+
+        assert sysa.as_posix() in result
+        assert sysb.as_posix() in result
+        assert len(result) == 2
+

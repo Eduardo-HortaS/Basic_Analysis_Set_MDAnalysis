@@ -7,6 +7,8 @@ import MDAnalysis as mda
 from MDAnalysis.analysis import hydrogenbonds
 from MDAnalysis.exceptions import NoDataError
 from utils import (
+    convert_time_from_ps,
+    validate_time_unit,
     transform_trajectory,
     build_complex_selection,
     resolve_trajectory_file,
@@ -101,13 +103,16 @@ def _to_portable_array(name, value):
 def _build_hbonds_payload(hbonds, *, d_a_cutoff, d_h_a_angle_cutoff,
                           start_frame, update_selections, acceptors_sel,
                           hydrogens_sel, between_pairs, parallel_backend,
-                          n_workers, hbonds_preset='custom'):
+                          n_workers, hbonds_preset='custom', time_unit='ps',
+                          time_corrected=False, atom_labels_by_index=None):
     """Build a strict portable dict payload for H-bonds plotting."""
     return {
         'times': _to_portable_array('times', hbonds.times),
         'count_by_time': _to_portable_array('count_by_time', hbonds.count_by_time()),
         'count_by_type': _to_portable_array('count_by_type', hbonds.count_by_type()),
         'count_by_ids': _to_portable_array('count_by_ids', hbonds.count_by_ids()),
+        'time_unit': str(time_unit),
+        'time_corrected': bool(time_corrected),
         'd_a_cutoff': float(d_a_cutoff),
         'd_h_a_angle_cutoff': float(d_h_a_angle_cutoff),
         'start_frame': int(start_frame),
@@ -118,7 +123,61 @@ def _build_hbonds_payload(hbonds, *, d_a_cutoff, d_h_a_angle_cutoff,
         'hbonds_preset': hbonds_preset,
         'parallel_backend': parallel_backend,
         'n_workers': int(n_workers),
+        'atom_labels_by_index': atom_labels_by_index or {},
     }
+
+
+def _build_atom_labels_map(universe, count_by_ids):
+    """Return atom label mapping for donor/hydrogen/acceptor ids used in count_by_ids."""
+    labels = {}
+    rows = np.asarray(count_by_ids)
+    if rows.size == 0:
+        return labels
+
+    # Collect referenced atom identifiers (id/index convention depends on MDAnalysis backend).
+    referenced = set()
+    for row in rows:
+        referenced.add(int(row[0]))
+        referenced.add(int(row[1]))
+        referenced.add(int(row[2]))
+
+    def _resolve_chain_label(atom):
+        """Return the best available chain-like identifier for an atom."""
+        for attr in ('chainID', 'segid'):
+            try:
+                value = getattr(atom, attr)
+            except Exception:
+                value = None
+            if value is None:
+                continue
+
+            value = str(value).strip()
+            if value:
+                return value
+
+        return ''
+
+    # Build a robust lookup by both atom.index and atom.id.
+    try:
+        atom_iter = iter(universe.atoms)
+    except Exception:
+        return labels
+
+    for atom in atom_iter:
+        try:
+            base_label = f"{atom.resname}{atom.resid}:{atom.name}"
+            chain_value = _resolve_chain_label(atom)
+            label = f"{base_label} [chain={chain_value}]" if chain_value else base_label
+            idx = int(atom.index)
+            aid = int(atom.id)
+        except Exception:
+            continue
+        if idx in referenced and idx not in labels:
+            labels[idx] = label
+        if aid in referenced and aid not in labels:
+            labels[aid] = label
+
+    return labels
 
 
 def _guess_bonds_if_missing(universe):
@@ -203,7 +262,7 @@ def _build_hbond_analysis_with_fallback(
 #   d_a_cutoff = 3.5         # Distance cutoff between donor and acceptor
 #   d_h_a_angle_cutoff = 150 # Angle cutoff for hydrogen bond
 
-def run_hbonds_analysis(systems, variations, num_replicates, d_a_cutoff, d_h_a_angle_cutoff, start_frame, traj_format, top_format='top', acceptors_sel=None, hydrogens_sel=None, between_pairs=None, update_selections=True, wrap_selection='auto', output_dir=None, parallel_backend='serial', n_workers=None, strict_wrapping=False, wrapped_manifest=None, input_dir=None, require_reference_pdb=False, hbonds_preset='custom'):
+def run_hbonds_analysis(systems, variations, num_replicates, d_a_cutoff, d_h_a_angle_cutoff, start_frame, traj_format, top_format='top', acceptors_sel=None, hydrogens_sel=None, between_pairs=None, update_selections=True, wrap_selection='auto', output_dir=None, parallel_backend='serial', n_workers=None, strict_wrapping=False, wrapped_manifest=None, input_dir=None, require_reference_pdb=False, hbonds_preset='custom', time_interval_between_frames=None, time_unit='ps'):
     """
     Runs the Hydrogen Bonds analysis for each system and variation and saves results as individual pickle files.
 
@@ -229,6 +288,7 @@ def run_hbonds_analysis(systems, variations, num_replicates, d_a_cutoff, d_h_a_a
     # Build parallelisation config — H-bonds supports parallel backends.
     parallel_cfg = ParallelConfig(backend=parallel_backend, n_workers=n_workers)
     run_kwargs = get_run_kwargs(parallel_cfg, analysis_key='hbonds')
+    validate_time_unit(time_unit)
 
     print("--- Starting Hydrogen Bonds calculation for each system and variation... ---")
 
@@ -319,6 +379,20 @@ def run_hbonds_analysis(systems, variations, num_replicates, d_a_cutoff, d_h_a_a
 
                 safe_run(hbonds, run_kwargs, start=start_frame, stop=None, step=1)
 
+                count_by_ids = hbonds.count_by_ids()
+                atom_labels_by_index = _build_atom_labels_map(u, count_by_ids)
+
+                if traj_format.lower() == 'dcd' and time_interval_between_frames is not None:
+                    # Rebuild time axis from frame index + user-provided dt (ps).
+                    frame_idx = np.arange(start_frame, start_frame + len(hbonds.times), dtype=float)
+                    corrected_times_ps = frame_idx * float(time_interval_between_frames)
+                    hbonds.times = convert_time_from_ps(corrected_times_ps, time_unit)
+                    payload_time_unit = time_unit
+                    payload_time_corrected = True
+                else:
+                    payload_time_unit = 'ps'
+                    payload_time_corrected = False
+
                 hbonds_result = _build_hbonds_payload(
                     hbonds,
                     d_a_cutoff=d_a_cutoff,
@@ -331,6 +405,9 @@ def run_hbonds_analysis(systems, variations, num_replicates, d_a_cutoff, d_h_a_a
                     parallel_backend=parallel_cfg.backend,
                     n_workers=run_kwargs.get('n_workers', 1),
                     hbonds_preset=preset_name,
+                    time_unit=payload_time_unit,
+                    time_corrected=payload_time_corrected,
+                    atom_labels_by_index=atom_labels_by_index,
                 )
 
                 with open(pickle_file, 'wb') as f:
@@ -384,6 +461,10 @@ def main():
                         help='MDAnalysis parallel backend (default: serial)')
     parser.add_argument('--n-workers', type=int, default=None,
                         help='Number of parallel workers (default: auto-detect)')
+    parser.add_argument('--time-interval-between-frames', type=float, default=None,
+                        help='Frame interval (ps) for DCD time-axis correction')
+    parser.add_argument('--time-unit', type=str, default='ps',
+                        help='Target time unit for corrected DCD axis (default: ps)')
 
     args = parser.parse_args()
 
@@ -441,6 +522,8 @@ def main():
         parallel_backend=args.parallel_backend,
         n_workers=args.n_workers,
         strict_wrapping=args.strict_wrapping,
+        time_interval_between_frames=args.time_interval_between_frames,
+        time_unit=args.time_unit,
     )
 
     return 0

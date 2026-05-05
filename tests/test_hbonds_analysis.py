@@ -16,6 +16,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from run_hbonds_analysis import (
     run_hbonds_analysis,
     _build_hbonds_payload,
+    _build_atom_labels_map,
     _resolve_hbond_selection_config,
 )
 
@@ -59,6 +60,8 @@ class TestPortablePayload:
         assert isinstance(payload['count_by_time'], np.ndarray)
         assert isinstance(payload['count_by_type'], np.ndarray)
         assert isinstance(payload['count_by_ids'], np.ndarray)
+        assert payload['time_unit'] == 'ps'
+        assert payload['time_corrected'] is False
         assert payload['hbonds_preset'] == 'custom'
         assert payload['parallel_backend'] == 'serial'
         assert payload['n_workers'] == 1
@@ -101,6 +104,81 @@ class TestHBondPresets:
                 hydrogens_sel=None,
                 between_pairs=None,
             )
+
+
+class TestHBondAtomLabelMap:
+    def test_atom_labels_include_chain_suffix(self):
+        class _Atom:
+            def __init__(self, index, atom_id, resname, resid, name, chain_id='', segid=''):
+                self.index = index
+                self.id = atom_id
+                self.resname = resname
+                self.resid = resid
+                self.name = name
+                self.chainID = chain_id
+                self.segid = segid
+
+        class _Universe:
+            def __init__(self, atoms):
+                self.atoms = atoms
+
+        universe = _Universe([
+            _Atom(10, 10, 'ASP', 10, 'OD1', chain_id='PROA'),
+            _Atom(11, 11, 'ASP', 10, 'HD1', chain_id='PROA'),
+            _Atom(20, 20, 'GLU', 20, 'OE2', chain_id='PROB'),
+        ])
+        count_by_ids = np.array([[10, 11, 20, 7]])
+
+        labels = _build_atom_labels_map(universe, count_by_ids)
+
+        assert labels[10] == 'ASP10:OD1 [chain=PROA]'
+        assert labels[11] == 'ASP10:HD1 [chain=PROA]'
+        assert labels[20] == 'GLU20:OE2 [chain=PROB]'
+
+    def test_atom_labels_fall_back_to_segid_when_chainid_missing(self):
+        class _Atom:
+            def __init__(self, index, atom_id, resname, resid, name, segid=''):
+                self.index = index
+                self.id = atom_id
+                self.resname = resname
+                self.resid = resid
+                self.name = name
+                self.segid = segid
+
+        class _Universe:
+            def __init__(self, atoms):
+                self.atoms = atoms
+
+        universe = _Universe([
+            _Atom(30, 30, 'SER', 30, 'OG', segid='PROC'),
+        ])
+        count_by_ids = np.array([[30, 30, 30, 1]])
+
+        labels = _build_atom_labels_map(universe, count_by_ids)
+
+        assert labels[30] == 'SER30:OG [chain=PROC]'
+
+    def test_atom_labels_fall_back_to_plain_label_without_chain(self):
+        class _Atom:
+            def __init__(self, index, atom_id, resname, resid, name):
+                self.index = index
+                self.id = atom_id
+                self.resname = resname
+                self.resid = resid
+                self.name = name
+                self.chainID = ''
+                self.segid = ''
+
+        class _Universe:
+            def __init__(self, atoms):
+                self.atoms = atoms
+
+        universe = _Universe([_Atom(30, 30, 'SER', 30, 'OG')])
+        count_by_ids = np.array([[30, 30, 30, 1]])
+
+        labels = _build_atom_labels_map(universe, count_by_ids)
+
+        assert labels[30] == 'SER30:OG'
 
 
 class TestRunHBondsAnalysis:

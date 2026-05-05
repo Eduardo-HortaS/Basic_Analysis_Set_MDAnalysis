@@ -286,7 +286,8 @@ class TestPlotHBonds:
 
         captured = {}
 
-        def _capture(times, counts, output_path, dpi=mod.DEFAULT_DPI, time_unit='ps', label=''):
+        def _capture(times, counts, output_path, dpi=mod.DEFAULT_DPI,
+                     time_unit='ps', source_time_unit='ps', label=''):
             captured['label'] = label
 
         monkeypatch.setattr(mod, 'plot_hbonds_by_time', _capture)
@@ -297,6 +298,70 @@ class TestPlotHBonds:
 
         assert 'custom' in captured['label'].lower()
         assert 'protein and name' not in captured['label'].lower()
+
+    def test_hbonds_source_time_unit_forwarded(self, mock_hbonds_pickle, tmp_path, monkeypatch):
+        """plot_hbonds should pass payload source time unit to by-time plotting."""
+        from plotting import plot_hbonds as mod
+
+        with open(mock_hbonds_pickle, 'rb') as f:
+            payload = pickle.load(f)
+        payload['time_unit'] = 'ns'
+        with open(mock_hbonds_pickle, 'wb') as f:
+            pickle.dump(payload, f)
+
+        captured = {}
+
+        def _capture(times, counts, output_path, dpi=mod.DEFAULT_DPI,
+                     time_unit='ps', source_time_unit='ps', label=''):
+            captured['source_time_unit'] = source_time_unit
+
+        monkeypatch.setattr(mod, 'plot_hbonds_by_time', _capture)
+        monkeypatch.setattr(mod, 'plot_hbonds_by_type', lambda *args, **kwargs: None)
+        monkeypatch.setattr(mod, 'plot_hbonds_by_ids', lambda *args, **kwargs: None)
+
+        mod.plot_hbonds(
+            mock_hbonds_pickle,
+            output_dir=str(tmp_path / 'out'),
+            dpi=72,
+            plot_types=['time'],
+            time_unit='ns',
+        )
+
+        assert captured['source_time_unit'] == 'ns'
+
+    def test_hbonds_by_ids_receives_atom_labels(self, mock_hbonds_pickle, tmp_path, monkeypatch):
+        """plot_hbonds should forward residue-aware atom labels to by-ids plotting."""
+        from plotting import plot_hbonds as mod
+
+        captured = {}
+
+        def _capture(id_counts, output_path, dpi=mod.DEFAULT_DPI, top_n=20, label='', atom_labels_by_index=None):
+            captured['atom_labels_by_index'] = atom_labels_by_index
+
+        monkeypatch.setattr(mod, 'plot_hbonds_by_ids', _capture)
+        monkeypatch.setattr(mod, 'plot_hbonds_by_time', lambda *args, **kwargs: None)
+        monkeypatch.setattr(mod, 'plot_hbonds_by_type', lambda *args, **kwargs: None)
+
+        mod.plot_hbonds(mock_hbonds_pickle, output_dir=str(tmp_path / 'out'), dpi=72, plot_types=['ids'])
+
+        assert captured['atom_labels_by_index'][10] == 'ASP10:OD1'
+
+    def test_hbonds_id_label_includes_chain_suffix_when_present(self):
+        """By-ids labels should preserve per-atom chain suffixes in donor/hydrogen/acceptor labels."""
+        from plotting.plot_hbonds import _format_hbond_id_label
+
+        row = np.array([10, 11, 20, 3])
+        labels = {
+            10: 'TRP68:NE1 [chain=PROB]',
+            11: 'TRP68:HE1 [chain=PROB]',
+            20: 'GLN132:OE1 [chain=PROA]',
+        }
+
+        formatted = _format_hbond_id_label(row, labels)
+
+        assert 'D:TRP68:NE1 [chain=PROB]' in formatted
+        assert 'H:TRP68:HE1 [chain=PROB]' in formatted
+        assert 'A:GLN132:OE1 [chain=PROA]' in formatted
 
     def test_hbonds_legacy_schema_raises(self, tmp_path):
         """Legacy non-dict H-bonds pickles should raise a schema error."""
@@ -448,16 +513,24 @@ class TestPlotRMSFComparison:
         """plot_rmsf_comparison_average should produce an averaged comparison PNG."""
         from plotting.plot_rmsf import plot_rmsf_comparison_average
         output_dir = str(tmp_path / 'out')
-        plot_rmsf_comparison_average(
-            mock_rmsf_replicate_groups,
-            labels=['SysA / wild', 'SysB / wild'],
-            group_name='avg_test',
-            output_dir=output_dir,
-            dpi=72,
-        )
-        pngs = [f for f in os.listdir(output_dir) if f.endswith('.png')]
-        assert len(pngs) == 1
-        assert 'average' in pngs[0].lower() or 'avg' in pngs[0].lower()
+        # Create three mock pickles with differing lengths to trigger truncation warning
+        p1 = tmp_path / 'a1.pkl'
+        p2 = tmp_path / 'a2.pkl'
+        p3 = tmp_path / 'a3.pkl'
+        with open(p1, 'wb') as f:
+            pickle.dump({'rmsf': np.ones(100), 'resids': np.arange(1, 101)}, f)
+        with open(p2, 'wb') as f:
+            pickle.dump({'rmsf': np.ones(95), 'resids': np.arange(1, 96)}, f)
+        with open(p3, 'wb') as f:
+            pickle.dump({'rmsf': np.ones(98), 'resids': np.arange(1, 99)}, f)
+
+        # Should warn about truncation and still create plot
+        import warnings
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter('always')
+            plot_rmsf_comparison_average([[str(p1), str(p2), str(p3)]], ['grp'], 'gname', output_dir=str(tmp_path))
+            assert any('truncating' in str(x.message).lower() or 'truncat' in str(x.message).lower() for x in w)
+        assert (tmp_path / 'rmsf_comparison_gname_avg.png').exists()
 
 
 # ─── Grouped Comparison Helper Tests ───────────────────────────────────────

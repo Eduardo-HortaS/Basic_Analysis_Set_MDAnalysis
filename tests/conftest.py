@@ -240,6 +240,8 @@ def mock_hbonds_pickle(tmp_path):
         'count_by_time': mock.count_by_time(),
         'count_by_type': mock.count_by_type(),
         'count_by_ids': mock.count_by_ids(),
+        'time_unit': 'ps',
+        'time_corrected': False,
         'd_a_cutoff': 3.5,
         'd_h_a_angle_cutoff': 150.0,
         'start_frame': 0,
@@ -250,6 +252,17 @@ def mock_hbonds_pickle(tmp_path):
         'hbonds_preset': 'custom',
         'parallel_backend': 'serial',
         'n_workers': 1,
+        'atom_labels_by_index': {
+            10: 'ASP10:OD1',
+            11: 'ASP10:HD1',
+            20: 'GLU20:OE2',
+            30: 'LYS30:NZ',
+            31: 'LYS30:HZ1',
+            40: 'SER40:OG',
+            50: 'ARG50:NE',
+            51: 'ARG50:HE',
+            60: 'TYR60:OH',
+        },
     }
     pkl_path = str(tmp_path / 'hbonds_plot_test_wild_rep1.pkl')
     with open(pkl_path, 'wb') as f:

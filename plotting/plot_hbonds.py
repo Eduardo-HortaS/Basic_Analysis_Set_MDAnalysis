@@ -25,7 +25,22 @@ from style import (
 )
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from utils import convert_time_from_ps, time_unit_label
+from utils import convert_time_from_ps, time_unit_label, TIME_UNITS, validate_time_unit
+
+
+def _convert_time_units(values, source_unit, target_unit):
+    """Convert time values between arbitrary supported units."""
+    validate_time_unit(source_unit)
+    validate_time_unit(target_unit)
+    values = np.asarray(values, dtype=float)
+    if source_unit == target_unit:
+        return values
+
+    if source_unit == 'ps':
+        return convert_time_from_ps(values, target_unit)
+
+    values_ps = values * TIME_UNITS[source_unit]
+    return convert_time_from_ps(values_ps, target_unit)
 
 
 def _load_hbonds_payload(pickle_file):
@@ -42,7 +57,20 @@ def _load_hbonds_payload(pickle_file):
         ) from exc
 
 
-def plot_hbonds_by_time(times, counts, output_path, dpi=DEFAULT_DPI, time_unit='ps', label=''):
+def _format_hbond_id_label(row, atom_labels_by_index):
+    """Format one count_by_ids row as donor-hydrogen-acceptor label."""
+    def _resolve_atom_label(atom_id):
+        atom_id = int(atom_id)
+        return atom_labels_by_index.get(atom_id, str(atom_id))
+
+    donor = _resolve_atom_label(row[0])
+    hydrogen = _resolve_atom_label(row[1])
+    acceptor = _resolve_atom_label(row[2])
+    return f"D:{donor}-H:{hydrogen}-A:{acceptor}"
+
+
+def plot_hbonds_by_time(times, counts, output_path, dpi=DEFAULT_DPI, time_unit='ps',
+                        source_time_unit='ps', label=''):
     """
     Plot hydrogen bond count over time.
 
@@ -67,7 +95,7 @@ def plot_hbonds_by_time(times, counts, output_path, dpi=DEFAULT_DPI, time_unit='
     times = np.asarray(times)
     counts = np.asarray(counts)
 
-    times = convert_time_from_ps(times, time_unit)
+    times = _convert_time_units(times, source_time_unit, time_unit)
 
     ax.plot(times, counts, color=color, lw=2.0, alpha=0.9)
 
@@ -129,7 +157,7 @@ def plot_hbonds_by_type(type_counts, output_path, dpi=DEFAULT_DPI, label=''):
     print(f"Saved H-bonds by type plot to {output_path}")
 
 
-def plot_hbonds_by_ids(id_counts, output_path, dpi=DEFAULT_DPI, top_n=20, label=''):
+def plot_hbonds_by_ids(id_counts, output_path, dpi=DEFAULT_DPI, top_n=20, label='', atom_labels_by_index=None):
     """
     Plot top-N most frequent hydrogen bonds by specific atom IDs.
 
@@ -156,7 +184,9 @@ def plot_hbonds_by_ids(id_counts, output_path, dpi=DEFAULT_DPI, top_n=20, label=
     # Already sorted by count (descending)
     top_data = id_counts[:top_n]
 
-    hb_labels = [f"D:{int(row[0])}-H:{int(row[1])}-A:{int(row[2])}" for row in top_data]
+    atom_labels_by_index = atom_labels_by_index or {}
+
+    hb_labels = [_format_hbond_id_label(row, atom_labels_by_index) for row in top_data]
     counts = [int(row[3]) for row in top_data]
 
     color = get_color_cycle(1)[0]
@@ -221,6 +251,8 @@ def plot_hbonds(pickle_file, output_dir='.', dpi=DEFAULT_DPI, plot_types=None,
     count_by_time = hbonds['count_by_time']
     count_by_type = hbonds['count_by_type']
     count_by_ids = hbonds['count_by_ids']
+    source_time_unit = hbonds.get('time_unit', 'ps')
+    atom_labels_by_index = hbonds.get('atom_labels_by_index', {})
     hbonds_preset = hbonds.get('hbonds_preset')
 
     if label is None:
@@ -232,7 +264,15 @@ def plot_hbonds(pickle_file, output_dir='.', dpi=DEFAULT_DPI, plot_types=None,
 
     if 'time' in plot_types:
         out = os.path.join(output_dir, f'{base_name}_by_time.png')
-        plot_hbonds_by_time(times, count_by_time, out, dpi=dpi, time_unit=time_unit, label=label)
+        plot_hbonds_by_time(
+            times,
+            count_by_time,
+            out,
+            dpi=dpi,
+            time_unit=time_unit,
+            source_time_unit=source_time_unit,
+            label=label,
+        )
 
     if 'type' in plot_types:
         out = os.path.join(output_dir, f'{base_name}_by_type.png')
@@ -240,7 +280,14 @@ def plot_hbonds(pickle_file, output_dir='.', dpi=DEFAULT_DPI, plot_types=None,
 
     if 'ids' in plot_types:
         out = os.path.join(output_dir, f'{base_name}_by_ids.png')
-        plot_hbonds_by_ids(count_by_ids, out, dpi=dpi, top_n=top_n, label=label)
+        plot_hbonds_by_ids(
+            count_by_ids,
+            out,
+            dpi=dpi,
+            top_n=top_n,
+            label=label,
+            atom_labels_by_index=atom_labels_by_index,
+        )
 
 
 def main():

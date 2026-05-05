@@ -11,6 +11,7 @@ import pickle
 import argparse
 import numpy as np
 import matplotlib.pyplot as plt
+import warnings
 
 import sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -236,9 +237,29 @@ def plot_rmsf_comparison_average(pickle_groups, labels, group_name, output_dir='
             all_rmsf.append(rmsf_values)
             if all_resids is None:
                 all_resids = resids
+            else:
+                # Validate residue numbering/length consistency across replicates
+                if len(resids) != len(all_resids):
+                    warnings.warn(
+                        f"RMSF averaging: replicate pickle '{os.path.basename(pkl)}' has {len(resids)} residues; "
+                        f"expected {len(all_resids)}. Averaging will truncate to shortest length.",
+                        UserWarning,
+                    )
+                elif not np.array_equal(np.asarray(resids[:min(len(resids), len(all_resids))]),
+                                        np.asarray(all_resids[:min(len(resids), len(all_resids))])):
+                    warnings.warn(
+                        f"RMSF averaging: replicate pickle '{os.path.basename(pkl)}' residue IDs do not match baseline. "
+                        f"Averaging will proceed by truncation/alignment to common length.",
+                        UserWarning,
+                    )
 
-        # Use shortest common length
+        # Use shortest common length (warned above if inconsistent)
         min_len = min(len(r) for r in all_rmsf)
+        if any(len(r) != min_len for r in all_rmsf):
+            warnings.warn(
+                f"RMSF averaging: truncating {len(all_rmsf)} replicates to {min_len} residues (shortest available).",
+                UserWarning,
+            )
         stacked = np.array([r[:min_len] for r in all_rmsf])
         mean_rmsf = np.mean(stacked, axis=0)
         std_rmsf = np.std(stacked, axis=0)

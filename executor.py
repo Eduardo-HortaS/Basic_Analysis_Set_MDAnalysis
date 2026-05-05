@@ -583,30 +583,35 @@ def run_rmsf(cfg, dry_run=False):
             print("  Chain intervals:", cfg['chain_intervals'])
         return
 
-    # RMSF uses only the first ref_selection (no iteration)
-    ref_sel = cfg['ref_selection'][0] if cfg['ref_selection'] else 'protein and backbone'
+    # Iterate over ref_selection entries (match RMSD behaviour)
+    ref_selections = cfg['ref_selection']  # already a list
+    for ref_idx, ref_sel in enumerate(ref_selections):
+        ref_suffix = f'_ref{ref_idx}' if len(ref_selections) > 1 else ''
+        if ref_suffix:
+            print(f"\n  --- ref_selection {ref_idx}: '{ref_sel}' ---")
 
-    run_rms_analysis(
-        systems=cfg['systems'],
-        variations=cfg['variations'],
-        num_replicates=cfg['num_replicates'],
-        analysis='RMSF',
-        target_selection=cfg['target_selection'],
-        ref_selection=ref_sel,
-        start_frame=cfg['start_frame'],
-        traj_format=cfg['traj_format'],
-        top_format=cfg['top_format'],
-        group_selections=cfg['rmsf_group_selections'],
-        chain_intervals=cfg['chain_intervals'],
-        wrap_selection=cfg['wrap_selection'],
-        wrapped_manifest=cfg.get('_wrapped_manifest'),
-        input_dir=cfg['input_dir'],
-        require_reference_pdb=True,
-        output_dir=os.path.join(cfg['_work_dir'], _ANALYSIS_SUBDIRS['rmsf']),
-        parallel_backend=cfg['parallel_backend'],
-        n_workers=cfg['n_workers'],
-        strict_wrapping=cfg['strict_wrapping'],
-    )
+        run_rms_analysis(
+            systems=cfg['systems'],
+            variations=cfg['variations'],
+            num_replicates=cfg['num_replicates'],
+            analysis='RMSF',
+            target_selection=cfg['target_selection'],
+            ref_selection=ref_sel,
+            start_frame=cfg['start_frame'],
+            traj_format=cfg['traj_format'],
+            top_format=cfg['top_format'],
+            group_selections=cfg['rmsf_group_selections'],
+            chain_intervals=cfg['chain_intervals'],
+            wrap_selection=cfg['wrap_selection'],
+            wrapped_manifest=cfg.get('_wrapped_manifest'),
+            input_dir=cfg['input_dir'],
+            require_reference_pdb=True,
+            output_dir=os.path.join(cfg['_work_dir'], _ANALYSIS_SUBDIRS['rmsf']),
+            parallel_backend=cfg['parallel_backend'],
+            n_workers=cfg['n_workers'],
+            strict_wrapping=cfg['strict_wrapping'],
+            ref_suffix=ref_suffix,
+        )
 
 
 def run_2d_rmsd(cfg, dry_run=False):
@@ -715,6 +720,8 @@ def run_hbonds(cfg, dry_run=False):
         parallel_backend=cfg['parallel_backend'],
         n_workers=cfg['n_workers'],
         strict_wrapping=cfg['strict_wrapping'],
+        time_interval_between_frames=cfg.get('time_interval_between_frames'),
+        time_unit=cfg['time_unit'],
     )
 
 
@@ -752,7 +759,8 @@ def _collect_pickles(work_dir, prefix, cfg, analysis_type=None, prune_stale_dupl
         import re
 
         sel_match = re.search(r'_sel(\d+)\.pkl$', basename)
-        chain_match = re.search(r'_chain([A-Za-z0-9]+)\.pkl$', basename)
+        canonical_name = re.sub(r'_sel\d+\.pkl$', '.pkl', basename)
+        chain_match = re.search(r'_chain([A-Za-z0-9]+)\.pkl$', canonical_name)
         chain_id = chain_match.group(1) if chain_match else ''
 
         metadata = None
@@ -767,11 +775,11 @@ def _collect_pickles(work_dir, prefix, cfg, analysis_type=None, prune_stale_dupl
             selection = metadata.get('selection', '')
             ref_selection = metadata.get('ref_selection', '')
             if analysis_type == 'rmsf':
-                key = ('rmsf', selection, ref_selection, chain_id)
+                key = ('rmsf', canonical_name, selection, ref_selection, chain_id)
             else:
-                key = ('rmsd', selection, ref_selection)
+                key = ('rmsd', canonical_name, selection, ref_selection)
         else:
-            key = (analysis_type or 'generic', basename)
+            key = (analysis_type or 'generic', canonical_name)
 
         # Keep the first canonical pickle we encounter for each logical key.
         # Canonical files (without *_selN) sort before legacy duplicates, so
@@ -1046,91 +1054,113 @@ def _plot_rmsf_comparison_groups(cfg, work_dir, plot_dir, all_pickles, dry_run):
     # If no chains, use [None] to mean "whole protein"
     chain_id_list = sorted(chain_ids) if chain_ids else [None]
 
+    # Detect selection and ref indices (parity with RMSD plotting)
+    sel_indices = _detect_selection_indices(work_dir, 'rmsf_plot', cfg)
+    ref_indices = _detect_ref_indices(work_dir, 'rmsf_plot', cfg)
+
     for group_name, members in cfg['plot_groups'].items():
-        for chain_id in chain_id_list:
-            chain_suffix = f'_chain{chain_id}' if chain_id else ''
+        for ref_idx in ref_indices:
+            ref_suffix = f' (ref{ref_idx})' if ref_idx is not None else ''
 
-            if replicate_mode == 'average':
-                pickle_groups = []
-                labels = []
+            for sel_idx in sel_indices:
+                sel_suffix = f' (sel{sel_idx})' if sel_idx is not None else ''
 
-                selection_label = ''
-                ref_selection_label = ''
-                for system, variation in members:
-                    rep_pickles = []
-                    for rep in range(1, cfg['num_replicates'] + 1):
-                        if chain_id:
-                            pattern = os.path.join(work_dir, f'rmsf_plot_{system}_{variation}_rep{rep}_chain{chain_id}.pkl')
-                        else:
-                            pattern = os.path.join(work_dir, f'rmsf_plot_{system}_{variation}_rep{rep}.pkl')
-                        matches = glob.glob(pattern)
-                        if matches:
-                            rep_pickles.append(matches[0])
-                            if not selection_label:
-                                selection_label, ref_selection_label = _get_rmsf_selection_label_from_pickle(matches[0])
-                    if rep_pickles:
-                        pickle_groups.append(rep_pickles)
-                        labels.append(f'{system} / {variation}')
+                for chain_id in chain_id_list:
+                    chain_suffix = f'_chain{chain_id}' if chain_id else ''
 
-                if not pickle_groups:
-                    continue
+                    if replicate_mode == 'average':
+                        pickle_groups = []
+                        labels = []
 
-                gname = f'{group_name}{chain_suffix}'
-                if dry_run:
-                    print(f"  [DRY RUN] Would plot averaged RMSF comparison: {gname}")
-                    continue
+                        selection_label = ''
+                        ref_selection_label = ''
+                        for system, variation in members:
+                            rep_pickles = []
+                            for rep in range(1, cfg['num_replicates'] + 1):
+                                pkl = _find_pickle_for_member(work_dir, 'rmsf_plot', system, variation, rep, sel_idx, ref_idx)
+                                # If chain-specific variant exists, _find_pickle_for_member will match wildcard
+                                if pkl and os.path.exists(pkl):
+                                    # filter by chain when requested
+                                    if chain_id:
+                                        if f'_chain{chain_id}.pkl' not in pkl:
+                                            # try to find a chain-specific pickle
+                                            alt = _find_pickle_for_member(work_dir, 'rmsf_plot', system, variation, rep, sel_idx, ref_idx)
+                                            if alt and f'_chain{chain_id}.pkl' in alt:
+                                                pkl = alt
+                                            else:
+                                                pkl = None
+                                    if pkl:
+                                        rep_pickles.append(pkl)
+                                        if not selection_label:
+                                            selection_label, ref_selection_label = _get_rmsf_selection_label_from_pickle(pkl)
+                            if rep_pickles:
+                                pickle_groups.append(rep_pickles)
+                                labels.append(f'{system} / {variation}')
 
-                print(f"  Plotting averaged RMSF comparison: {gname}")
-                plot_rmsf_comparison_average(
-                    pickle_groups, labels, gname,
-                    output_dir=plot_dir, dpi=cfg['dpi'],
-                    selection_label=' | '.join(
-                        p for p in (
-                            f"target={selection_label}" if selection_label else '',
-                            f"ref={ref_selection_label}" if ref_selection_label else '',
-                        ) if p
-                    ),
-                )
-            else:
-                for rep in range(1, cfg['num_replicates'] + 1):
-                    pkl_files = []
-                    labels = []
-                    selection_label = ''
-                    ref_selection_label = ''
+                        if not pickle_groups:
+                            # No pickles for this combination
+                            continue
 
-                    for system, variation in members:
-                        if chain_id:
-                            pattern = os.path.join(work_dir, f'rmsf_plot_{system}_{variation}_rep{rep}_chain{chain_id}.pkl')
-                        else:
-                            pattern = os.path.join(work_dir, f'rmsf_plot_{system}_{variation}_rep{rep}.pkl')
-                        matches = glob.glob(pattern)
-                        if matches:
-                            pkl_files.append(matches[0])
-                            labels.append(f'{system} / {variation}')
-                            if not selection_label:
-                                selection_label, ref_selection_label = _get_rmsf_selection_label_from_pickle(matches[0])
+                        gname = f'{group_name}{ref_suffix}{sel_suffix}{chain_suffix}'.strip()
+                        if dry_run:
+                            print(f"  [DRY RUN] Would plot averaged RMSF comparison: {gname}")
+                            continue
 
-                    if not pkl_files:
-                        continue
+                        print(f"  Plotting averaged RMSF comparison: {gname}")
+                        plot_rmsf_comparison_average(
+                            pickle_groups, labels, gname,
+                            output_dir=plot_dir, dpi=cfg['dpi'],
+                            selection_label=' | '.join(
+                                p for p in (
+                                    f"target={selection_label}" if selection_label else '',
+                                    f"ref={ref_selection_label}" if ref_selection_label else '',
+                                ) if p
+                            ),
+                        )
+                    else:
+                        for rep in range(1, cfg['num_replicates'] + 1):
+                            pkl_files = []
+                            labels = []
+                            selection_label = ''
+                            ref_selection_label = ''
 
-                    rep_suffix = f'_rep{rep}' if cfg['num_replicates'] > 1 else ''
-                    gname = f'{group_name}{chain_suffix}{rep_suffix}'
+                            for system, variation in members:
+                                pkl = _find_pickle_for_member(work_dir, 'rmsf_plot', system, variation, rep, sel_idx, ref_idx)
+                                if pkl and os.path.exists(pkl):
+                                    if chain_id and f'_chain{chain_id}.pkl' not in pkl:
+                                        # try to find explicit chain variant
+                                        alt = _find_pickle_for_member(work_dir, 'rmsf_plot', system, variation, rep, sel_idx, ref_idx)
+                                        if alt and f'_chain{chain_id}.pkl' in alt:
+                                            pkl = alt
+                                        else:
+                                            pkl = None
+                                if pkl:
+                                    pkl_files.append(pkl)
+                                    labels.append(f'{system} / {variation}')
+                                    if not selection_label:
+                                        selection_label, ref_selection_label = _get_rmsf_selection_label_from_pickle(pkl)
 
-                    if dry_run:
-                        print(f"  [DRY RUN] Would plot RMSF comparison: {gname}")
-                        continue
+                            if not pkl_files:
+                                continue
 
-                    print(f"  Plotting RMSF comparison: {gname}")
-                    plot_rmsf_comparison(
-                        pkl_files, labels, gname,
-                        output_dir=plot_dir, dpi=cfg['dpi'],
-                        selection_label=' | '.join(
-                            p for p in (
-                                f"target={selection_label}" if selection_label else '',
-                                f"ref={ref_selection_label}" if ref_selection_label else '',
-                            ) if p
-                        ),
-                    )
+                            rep_suffix = f'_rep{rep}' if cfg['num_replicates'] > 1 else ''
+                            gname = f'{group_name}{chain_suffix}{rep_suffix}'
+
+                            if dry_run:
+                                print(f"  [DRY RUN] Would plot RMSF comparison: {gname}")
+                                continue
+
+                            print(f"  Plotting RMSF comparison: {gname}")
+                            plot_rmsf_comparison(
+                                pkl_files, labels, gname,
+                                output_dir=plot_dir, dpi=cfg['dpi'],
+                                selection_label=' | '.join(
+                                    p for p in (
+                                        f"target={selection_label}" if selection_label else '',
+                                        f"ref={ref_selection_label}" if ref_selection_label else '',
+                                    ) if p
+                                ),
+                            )
 
 
 def plot_2d_rmsd_results(cfg, work_dir, dry_run=False):
