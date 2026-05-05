@@ -95,6 +95,7 @@ inis/*.ini
 
 
 # Machine-specific Nextflow params
+nf_yml/
 nf_yml/nucleolin.yml
 conf/local_boltz.config
 
