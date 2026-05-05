@@ -43,6 +43,8 @@ htmlcov/
 dmypy.json
 .pyre/
 .pytype/
+compare_outputs.py
+compare_parallel_serial.py
 
 # Notebook / interactive artifacts
 .ipynb_checkpoints/
@@ -93,7 +95,7 @@ inis/*.ini
 
 
 # Machine-specific Nextflow params
-yml_nf/*.yml
+yml_nf/nucleolin.yml
 conf/local_boltz.config
 
 # Local helper scratch area
