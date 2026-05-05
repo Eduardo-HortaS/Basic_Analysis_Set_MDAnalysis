@@ -95,7 +95,7 @@ inis/*.ini
 
 
 # Machine-specific Nextflow params
-yml_nf/nucleolin.yml
+nf_yml/nucleolin.yml
 conf/local_boltz.config
 
 # Local helper scratch area
