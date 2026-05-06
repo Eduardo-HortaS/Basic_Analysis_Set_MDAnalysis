@@ -79,7 +79,7 @@ docs/
 
 # Local validation reports (root-generated)
 *.md
-README.md
+!README.md
 
 # tests 
 .test_results
