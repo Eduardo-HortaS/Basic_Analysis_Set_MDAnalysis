@@ -143,8 +143,6 @@ nextflow run main.nf -profile test,local16
 > systems with multiple replicates, prefer the Nextflow pipeline which
 > parallelises each (system, variation, replicate) independently.
 
-See [docs/ANALYZING_PROTOCOL.md](docs/ANALYZING_PROTOCOL.md) for full usage examples.
-
 ## Plot Groups (RMSD/RMSF)
 
 Named comparison plot groups let you overlay systems/variations in shared plots.
@@ -161,9 +159,8 @@ Example INI section:
 
 ```ini
 [plot_groups]
-replicate_mode = separate
-Ung_GC_vs_TA = [["Ung_G-C_4", "wild"], ["Ung_T-A_4", "wild"]]
-Ung_GC_vs_UG = [["Ung_G-C_4", "wild"], ["Ung_U-G", "mut"]]
+replicate_mode = # average or separate
+systemX_variationX_vs_systemX_variationX = [["systemX", "variationX"], "]]
 ```
 
 ## Parallelization (MDAnalysis 2.8+)
@@ -221,19 +218,6 @@ uv run python compare_parallel_serial.py \
     --dir-serial results_comparison/work
 ```
 
-## Ensuring Output Parity
-
-Both executor.py and Nextflow produce identical per-analysis subdirectory
-layouts with semantically equivalent pickle files.  See
-[docs/REPRODUCIBILITY_GUIDE.md](docs/REPRODUCIBILITY_GUIDE.md) for details.
-
-```bash
-# Compare outputs
-uv run python compare_outputs.py \
-    --dir-python  results/work \
-    --dir-nextflow results_nf
-```
-
 ## Testing
 
 ```bash
@@ -246,8 +230,6 @@ uv run pytest tests/ -v
 # Nextflow tests (requires Nextflow + .test_data/)
 uv run pytest tests/ -m nextflow -v
 ```
-
-See [docs/TEST_DETAILS.md](docs/TEST_DETAILS.md) for test suite documentation.
 
 ## Analysis Requirements
 
