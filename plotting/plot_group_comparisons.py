@@ -12,7 +12,38 @@ import glob
 import json
 import os
 import pickle
+import sys
 from typing import Any
+
+
+def _import_rmsd_plotters():
+    """Import RMSD plot helpers when run as package or standalone script."""
+    try:
+        from plotting.plot_rmsd import plot_rmsd_comparison, plot_rmsd_comparison_average
+        return plot_rmsd_comparison, plot_rmsd_comparison_average
+    except ModuleNotFoundError:
+        # Nextflow runs this script from a work directory, so make the
+        # local plotting directory importable as a fallback.
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        if script_dir not in sys.path:
+            sys.path.insert(0, script_dir)
+        from plot_rmsd import plot_rmsd_comparison, plot_rmsd_comparison_average
+        return plot_rmsd_comparison, plot_rmsd_comparison_average
+
+
+def _import_rmsf_plotters():
+    """Import RMSF plot helpers when run as package or standalone script."""
+    try:
+        from plotting.plot_rmsf import plot_rmsf_comparison, plot_rmsf_comparison_average
+        return plot_rmsf_comparison, plot_rmsf_comparison_average
+    except ModuleNotFoundError:
+        # Nextflow runs this script from a work directory, so make the
+        # local plotting directory importable as a fallback.
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        if script_dir not in sys.path:
+            sys.path.insert(0, script_dir)
+        from plot_rmsf import plot_rmsf_comparison, plot_rmsf_comparison_average
+        return plot_rmsf_comparison, plot_rmsf_comparison_average
 
 
 def _parse_bool(value: Any) -> bool:
@@ -142,7 +173,7 @@ def _get_selection_label_from_pickle(pkl_path: str) -> tuple[str, str]:
 def _plot_rmsd_groups(plot_groups: dict[str, list[tuple[str, str]]], *, work_dir: str,
                       output_dir: str, num_replicates: int, dpi: int,
                       replicate_mode: str, rmsd_show_kde: bool) -> int:
-    from plotting.plot_rmsd import plot_rmsd_comparison, plot_rmsd_comparison_average
+    plot_rmsd_comparison, plot_rmsd_comparison_average = _import_rmsd_plotters()
 
     produced = 0
     sel_indices = _detect_selection_indices(work_dir, 'rmsd_plot')
@@ -239,7 +270,7 @@ def _plot_rmsd_groups(plot_groups: dict[str, list[tuple[str, str]]], *, work_dir
 def _plot_rmsf_groups(plot_groups: dict[str, list[tuple[str, str]]], *, work_dir: str,
                       output_dir: str, num_replicates: int, dpi: int,
                       replicate_mode: str, target_selection: str) -> int:
-    from plotting.plot_rmsf import plot_rmsf_comparison, plot_rmsf_comparison_average
+    plot_rmsf_comparison, plot_rmsf_comparison_average = _import_rmsf_plotters()
 
     produced = 0
 
