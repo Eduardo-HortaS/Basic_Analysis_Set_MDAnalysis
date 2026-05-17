@@ -68,10 +68,18 @@ def _resolve_hbond_selection_config(hbonds_preset, acceptors_sel, hydrogens_sel,
         )
 
     resolved = _hbond_preset_defaults(preset)
+    # Treat explicit string 'none' (case-insensitive) as a disable marker -> None
+    def _none_to_none(val):
+        if val is None:
+            return None
+        if isinstance(val, str) and val.strip().lower() == 'none':
+            return None
+        return val
+
     if acceptors_sel is not None:
-        resolved['acceptors_sel'] = acceptors_sel
+        resolved['acceptors_sel'] = _none_to_none(acceptors_sel)
     if hydrogens_sel is not None:
-        resolved['hydrogens_sel'] = hydrogens_sel
+        resolved['hydrogens_sel'] = _none_to_none(hydrogens_sel)
     if between_pairs is not None:
         resolved['between_pairs'] = between_pairs
 
@@ -200,6 +208,17 @@ def _build_hbond_analysis_with_fallback(
     update_selections,
 ):
     """Create HydrogenBondAnalysis with robust fallbacks for sparse topologies."""
+    # Normalize 'none' strings to None to avoid MDAnalysis selection parsing errors
+    def _norm_none(v):
+        if v is None:
+            return None
+        if isinstance(v, str) and v.strip().lower() == 'none':
+            return None
+        return v
+
+    acceptors_sel = _norm_none(acceptors_sel)
+    hydrogens_sel = _norm_none(hydrogens_sel)
+
     kwargs = {
         'acceptors_sel': acceptors_sel,
         'hydrogens_sel': hydrogens_sel,
@@ -299,6 +318,26 @@ def run_hbonds_analysis(systems, variations, num_replicates, d_a_cutoff, d_h_a_a
         between_pairs,
     )
     print(f"H-bonds preset: {preset_name}")
+
+    # Normalize selection sentinel values that may have been passed as the
+    # literal string "none" from shell/Nextflow. Ensure the payload stores
+    # Python `None` instead of the string "none" to make comparisons stable.
+    def _normalize_sel(val):
+        if val is None:
+            return None
+        if isinstance(val, str) and val.strip().lower() == 'none':
+            return None
+        return val
+
+    resolved_acceptors_sel = _normalize_sel(resolved_acceptors_sel)
+    resolved_hydrogens_sel = _normalize_sel(resolved_hydrogens_sel)
+    # between_pairs may arrive as a JSON string from CLI; convert to list if so
+    if isinstance(resolved_between_pairs, str):
+        try:
+            resolved_between_pairs = json.loads(resolved_between_pairs)
+        except Exception:
+            # leave as-is; downstream validation will catch malformed values
+            pass
 
     reps = range(1, num_replicates + 1)
 
