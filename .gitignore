@@ -105,3 +105,6 @@ scripts/local/
 # OS files
 .DS_Store
 Thumbs.db
+
+# TCL inspo
+trajectory_prep_component/*.tcl
