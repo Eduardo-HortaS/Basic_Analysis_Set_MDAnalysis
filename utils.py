@@ -255,7 +255,7 @@ def align_trajectory(universe, selection, analysis, system, variation, rep, traj
 
 
 def resolve_trajectory_file(system, variation, rep, traj_format, base_dir=None):
-    """Return a trajectory path supporting both ``rep_1`` and ``rep1`` naming.
+    """Return a trajectory path supporting both flat and nested layouts.
 
     Parameters
     ----------
@@ -277,6 +277,10 @@ def resolve_trajectory_file(system, variation, rep, traj_format, base_dir=None):
         ``candidates`` contains both attempted paths in priority order.
     """
     candidates = [
+        f'{system}/{system}_{variation}_production_rep_{rep}.{traj_format}',
+        f'{system}/{system}_{variation}_production_rep{rep}.{traj_format}',
+        f'{system}/{system}_production_{variation}_rep_{rep}.{traj_format}',
+        f'{system}/{system}_production_{variation}_rep{rep}.{traj_format}',
         f'{system}/{variation}/{system}_production_{variation}_rep_{rep}.{traj_format}',
         f'{system}/{variation}/{system}_production_{variation}_rep{rep}.{traj_format}',
     ]
@@ -292,16 +296,32 @@ def resolve_trajectory_file(system, variation, rep, traj_format, base_dir=None):
 
 def resolve_topology_file(system, variation, top_format, base_dir=None):
     """Return the expected topology path for a system/variation."""
-    rel_path = f'{system}/{variation}/{system}_system_{variation}.{top_format}'
-    path = os.path.join(base_dir, rel_path) if base_dir else rel_path
-    return path, rel_path
+    candidates = [
+        f'{system}/{system}_{variation}_system.{top_format}',
+        f'{system}/{system}_system_{variation}.{top_format}',
+        f'{system}/{variation}/{system}_system_{variation}.{top_format}',
+    ]
+    for rel_path in candidates:
+        path = os.path.join(base_dir, rel_path) if base_dir else rel_path
+        if os.path.isfile(path):
+            return path, rel_path
+    default_path = os.path.join(base_dir, candidates[0]) if base_dir else candidates[0]
+    return default_path, candidates[0]
 
 
 def resolve_reference_pdb_file(system, variation, base_dir=None):
     """Return required reference PDB path for chain metadata."""
-    rel_path = f'{system}/{variation}/{system}_system_{variation}.pdb'
-    path = os.path.join(base_dir, rel_path) if base_dir else rel_path
-    return path, rel_path
+    candidates = [
+        f'{system}/{system}_{variation}_system.pdb',
+        f'{system}/{system}_system_{variation}.pdb',
+        f'{system}/{variation}/{system}_system_{variation}.pdb',
+    ]
+    for rel_path in candidates:
+        path = os.path.join(base_dir, rel_path) if base_dir else rel_path
+        if os.path.isfile(path):
+            return path, rel_path
+    default_path = os.path.join(base_dir, candidates[0]) if base_dir else candidates[0]
+    return default_path, candidates[0]
 
 
 def cleanup_work_directory(work_dir, preserve_extensions=None, verbose=True):

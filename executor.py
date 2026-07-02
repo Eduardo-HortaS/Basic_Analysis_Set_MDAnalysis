@@ -430,16 +430,21 @@ def setup_workdir(cfg):
             data_dir = os.path.join(work_dir, system, variation)
             os.makedirs(data_dir, exist_ok=True)
 
-            src_dir = os.path.join(input_dir, system, variation)
-            if not os.path.isdir(src_dir):
-                print(f"  WARNING: Source directory not found: {src_dir}")
+            candidate_dirs = [
+                os.path.join(input_dir, system),
+                os.path.join(input_dir, system, variation),
+            ]
+            src_dirs = [src for src in candidate_dirs if os.path.isdir(src)]
+            if not src_dirs:
+                print(f"  WARNING: Source directory not found: {candidate_dirs[0]} or {candidate_dirs[1]}")
                 continue
 
-            for fname in os.listdir(src_dir):
-                src = os.path.join(src_dir, fname)
-                dst = os.path.join(data_dir, fname)
-                if os.path.isfile(src) and not os.path.exists(dst):
-                    os.symlink(os.path.abspath(src), dst)
+            for src_dir in src_dirs:
+                for fname in os.listdir(src_dir):
+                    src = os.path.join(src_dir, fname)
+                    dst = os.path.join(data_dir, fname)
+                    if os.path.isfile(src) and not os.path.exists(dst):
+                        os.symlink(os.path.abspath(src), dst)
 
     # Pre-create per-analysis subdirectories
     for subdir in _ANALYSIS_SUBDIRS.values():
@@ -872,22 +877,30 @@ def _find_pickle_for_member(work_dir, prefix, system, variation, rep, sel_idx=No
 
 def _detect_selection_indices(work_dir, prefix, cfg):
     """Detect all selection indices present in RMSD pickle names.
-    Returns a sorted list of sel_idx integers, or [None] if no _selN suffix found."""
+    Returns a sorted list including None (for base/target_selection) and any _selN indices."""
     sel_indices = set()
+    has_base = False
     for system in cfg['systems']:
         for variation in cfg['variations'][system]:
             for rep in range(1, cfg['num_replicates'] + 1):
+                # Check for _selN files
                 pattern = os.path.join(work_dir, f'{prefix}_{system}_{variation}_rep{rep}*_sel*.pkl')
                 for match in glob.glob(pattern):
                     basename = os.path.basename(match)
-                    # Extract selN from basename
                     import re
                     m = re.search(r'_sel(\d+)\.pkl$', basename)
                     if m:
                         sel_indices.add(int(m.group(1)))
-    if sel_indices:
-        return sorted(sel_indices)
-    return [None]
+                # Check for base file (no _sel suffix)
+                base_pattern = os.path.join(work_dir, f'{prefix}_{system}_{variation}_rep{rep}.pkl')
+                if glob.glob(base_pattern):
+                    has_base = True
+    # Always include None (base selection) if base files exist
+    result = []
+    if has_base:
+        result.append(None)
+    result.extend(sorted(sel_indices))
+    return result if result else [None]
 
 
 def _detect_ref_indices(work_dir, prefix, cfg):
@@ -1184,8 +1197,8 @@ def plot_2d_rmsd_results(cfg, work_dir, dry_run=False):
 
 
 def plot_rog_results(cfg, work_dir, dry_run=False):
-    """Plot all RoG results."""
-    from plotting.plot_rog import plot_rog
+    """Plot all RoG results — individual + comparison group overlays."""
+    from plotting.plot_rog import plot_rog, plot_rog_comparison, plot_rog_comparison_average
 
     pickles = _collect_pickles(work_dir, 'rog_plot', cfg, analysis_type='rog')
     if not pickles:
@@ -1195,6 +1208,7 @@ def plot_rog_results(cfg, work_dir, dry_run=False):
     plot_dir = os.path.join(cfg['plot_dir'], 'rog')
     os.makedirs(plot_dir, exist_ok=True)
 
+    # Individual plots
     for pkl in pickles:
         if dry_run:
             print(f"  [DRY RUN] Would plot: {os.path.basename(pkl)}")
@@ -1202,10 +1216,85 @@ def plot_rog_results(cfg, work_dir, dry_run=False):
         print(f"  Plotting: {os.path.basename(pkl)}")
         plot_rog(pkl, output_dir=plot_dir, dpi=cfg['dpi'], show_kde=cfg['rog_show_kde'])
 
+    # Comparison group plots
+    if cfg.get('plot_groups'):
+        rog_dir = os.path.join(work_dir, _ANALYSIS_SUBDIRS['rog'])
+        _plot_rog_comparison_groups(cfg, rog_dir, plot_dir, pickles, dry_run)
+
+
+def _plot_rog_comparison_groups(cfg, work_dir, plot_dir, all_pickles, dry_run):
+    """Generate RoG comparison plots for each named plot_group."""
+    from plotting.plot_rog import plot_rog_comparison, plot_rog_comparison_average
+
+    replicate_mode = cfg.get('replicate_mode', 'separate')
+
+    for group_name, members in cfg['plot_groups'].items():
+        if replicate_mode == 'average':
+            # Average across replicates
+            pickle_groups = []
+            labels = []
+            selection_label = ''
+
+            for system, variation in members:
+                rep_pickles = []
+                for rep in range(1, cfg['num_replicates'] + 1):
+                    pkl = _find_pickle_for_member(work_dir, 'rog_plot', system, variation, rep)
+                    if pkl and os.path.exists(pkl):
+                        rep_pickles.append(pkl)
+                if rep_pickles:
+                    pickle_groups.append(rep_pickles)
+                    labels.append(f'{system} / {variation}')
+
+            if not pickle_groups:
+                print(f"  WARNING: No pickles found for group '{group_name}'. Skipping.")
+                continue
+
+            gname = f'{group_name} (averaged)'
+            if dry_run:
+                print(f"  [DRY RUN] Would plot averaged RoG comparison: {gname}")
+                continue
+
+            print(f"  Plotting averaged RoG comparison: {gname}")
+            plot_rog_comparison_average(
+                pickle_groups, labels, gname,
+                output_dir=plot_dir, dpi=cfg['dpi'],
+                show_kde=cfg['rog_show_kde'],
+                selection_label=selection_label,
+            )
+        else:
+            # Separate: one comparison plot per replicate
+            for rep in range(1, cfg['num_replicates'] + 1):
+                pkl_files = []
+                labels = []
+
+                for system, variation in members:
+                    pkl = _find_pickle_for_member(work_dir, 'rog_plot', system, variation, rep)
+                    if pkl and os.path.exists(pkl):
+                        pkl_files.append(pkl)
+                        labels.append(f'{system} / {variation}')
+
+                if not pkl_files:
+                    continue
+
+                rep_suffix = f'_rep{rep}' if cfg['num_replicates'] > 1 else ''
+                gname = f'{group_name}{rep_suffix}'
+
+                if dry_run:
+                    print(f"  [DRY RUN] Would plot RoG comparison: {gname}")
+                    continue
+
+                print(f"  Plotting RoG comparison: {gname}")
+                plot_rog_comparison(
+                    pkl_files, labels, gname,
+                    output_dir=plot_dir, dpi=cfg['dpi'],
+                    show_kde=cfg['rog_show_kde'],
+                    selection_label='',
+                )
+
 
 def plot_hbonds_results(cfg, work_dir, dry_run=False):
     """Plot all H-bond results."""
-    from plotting.plot_hbonds import plot_hbonds
+    from plotting.plot_hbonds import plot_hbonds, plot_hbonds_average
 
     pickles = _collect_pickles(work_dir, 'hbonds_plot', cfg, analysis_type='hbonds')
     if not pickles:
@@ -1222,6 +1311,19 @@ def plot_hbonds_results(cfg, work_dir, dry_run=False):
         print(f"  Plotting: {os.path.basename(pkl)}")
         plot_hbonds(pkl, output_dir=plot_dir, dpi=cfg['dpi'],
                     time_unit=cfg['time_unit'], top_n=cfg['hbonds_top_n'])
+
+    if dry_run:
+        avg_targets = ', '.join(os.path.basename(p) for p in pickles)
+        print(f"  [DRY RUN] Would plot averaged H-bonds for: {avg_targets}")
+        return
+
+    plot_hbonds_average(
+        pickles,
+        output_dir=plot_dir,
+        dpi=cfg['dpi'],
+        time_unit=cfg['time_unit'],
+        top_n=cfg['hbonds_top_n'],
+    )
 
 
 # ─── Pickle validation for plot-only scenarios ──────────────────────────────
@@ -1312,8 +1414,12 @@ def validate_inputs(cfg):
 
         for variation in cfg['variations'][system]:
             for rep in range(1, cfg['num_replicates'] + 1):
-                top = os.path.join(input_dir, system, variation,
-                                   f'{system}_system_{variation}.{cfg["top_format"]}')
+                top, _ = resolve_topology_file(
+                    system,
+                    variation,
+                    cfg['top_format'],
+                    base_dir=input_dir,
+                )
                 ref_pdb, _ = resolve_reference_pdb_file(
                     system,
                     variation,

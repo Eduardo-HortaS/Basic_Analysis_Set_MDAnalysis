@@ -28,7 +28,7 @@ params.num_replicates   = 1
 params.traj_format      = 'dcd'
 params.top_format       = 'top'
 params.start_frame      = 0
-params.input_dir        = '.'     // Base directory containing {system}/{variation}/ structure
+params.input_dir        = '.'     // Base directory containing {system}/ (flat) or {system}/{variation}/ (legacy) structure
 params.outdir           = 'results_nf'
 
 // Analysis toggles
@@ -159,6 +159,7 @@ workflow {
         RUN_HBONDS(wrapped_inputs)
         if (params.plot_hbonds) {
             PLOT_HBONDS(RUN_HBONDS.out.pickle)
+            PLOT_HBONDS_AVERAGE(RUN_HBONDS.out.pickle.collect())
         }
     }
 }
@@ -192,7 +193,7 @@ def generate_combinations() {
         variations[system].each { variation ->
             (1..params.num_replicates).each { rep ->
                 def traj = resolve_traj_file(system, variation, rep)
-                def top  = file("${params.input_dir}/${system}/${variation}/${system}_system_${variation}.${params.top_format}")
+                def top  = resolve_top_file(system, variation)
                 combos.add(tuple(system, variation, rep, top, traj))
             }
         }
@@ -200,7 +201,46 @@ def generate_combinations() {
     return combos
 }
 
+def resolve_top_file(system, variation) {
+    def flat = file("${params.input_dir}/${system}/${system}_${variation}_system.${params.top_format}")
+    if (flat.exists()) {
+        return flat
+    }
+
+    def flatLegacy = file("${params.input_dir}/${system}/${system}_system_${variation}.${params.top_format}")
+    if (flatLegacy.exists()) {
+        return flatLegacy
+    }
+
+    def nested = file("${params.input_dir}/${system}/${variation}/${system}_system_${variation}.${params.top_format}")
+    if (nested.exists()) {
+        return nested
+    }
+
+    return flat
+}
+
 def resolve_traj_file(system, variation, rep) {
+    def flatUnderscore = file("${params.input_dir}/${system}/${system}_${variation}_production_rep_${rep}.${params.traj_format}")
+    if (flatUnderscore.exists()) {
+        return flatUnderscore
+    }
+
+    def flatNoUnderscore = file("${params.input_dir}/${system}/${system}_${variation}_production_rep${rep}.${params.traj_format}")
+    if (flatNoUnderscore.exists()) {
+        return flatNoUnderscore
+    }
+
+    def flatLegacyUnderscore = file("${params.input_dir}/${system}/${system}_production_${variation}_rep_${rep}.${params.traj_format}")
+    if (flatLegacyUnderscore.exists()) {
+        return flatLegacyUnderscore
+    }
+
+    def flatLegacyNoUnderscore = file("${params.input_dir}/${system}/${system}_production_${variation}_rep${rep}.${params.traj_format}")
+    if (flatLegacyNoUnderscore.exists()) {
+        return flatLegacyNoUnderscore
+    }
+
     def withUnderscore = file("${params.input_dir}/${system}/${variation}/${system}_production_${variation}_rep_${rep}.${params.traj_format}")
     if (withUnderscore.exists()) {
         return withUnderscore
@@ -759,6 +799,28 @@ process PLOT_HBONDS {
         --output-dir . \\
         --dpi ${params.dpi} \\
         --time-unit ${params.time_unit} \\
+        --top-n ${params.hbonds_top_n}
+    """
+}
+
+process PLOT_HBONDS_AVERAGE {
+    label 'process_low'
+    publishDir "${params.outdir}/plots/hbonds", mode: 'copy'
+    cache 'lenient'
+
+    input:
+    path(pickles)
+
+    output:
+    path("*.png"), emit: plot, optional: true
+
+    script:
+    """
+    python ${get_script_dir()}/plotting/plot_hbonds.py \
+        --pickle-files ${pickles} \
+        --output-dir . \
+        --dpi ${params.dpi} \
+        --time-unit ${params.time_unit} \
         --top-n ${params.hbonds_top_n}
     """
 }

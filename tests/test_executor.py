@@ -22,6 +22,7 @@ from executor import (
     _normalize_chain_intervals,
     load_config,
     validate_plot_pickles,
+    validate_inputs,
     _collect_pickles,
     setup_workdir,
     _clean_ephemeral_files,
@@ -805,6 +806,48 @@ class TestSetupWorkdir:
         data_dir = os.path.join(work_dir, 'SysA', 'v1')
         assert os.path.isdir(data_dir)
         assert os.path.islink(os.path.join(data_dir, 'SysA_system_v1.top'))
+
+    def test_supports_system_only_input_layout(self, tmp_path):
+        input_dir = tmp_path / 'input'
+        input_dir.mkdir()
+        sys_dir = input_dir / 'SysA'
+        sys_dir.mkdir()
+        (sys_dir / 'SysA_v1_system.top').write_bytes(b'fake topology')
+        (sys_dir / 'SysA_v1_production_rep_1.dcd').write_bytes(b'fake traj')
+
+        cfg = {
+            'systems': ['SysA'],
+            'variations': {'SysA': ['v1']},
+            'num_replicates': 1,
+            'input_dir': str(input_dir),
+            'output_dir': str(tmp_path / 'results'),
+        }
+
+        work_dir = setup_workdir(cfg)
+        data_dir = os.path.join(work_dir, 'SysA', 'v1')
+        assert os.path.islink(os.path.join(data_dir, 'SysA_v1_system.top'))
+        assert os.path.islink(os.path.join(data_dir, 'SysA_v1_production_rep_1.dcd'))
+
+    def test_validate_inputs_supports_system_only_input_layout(self, tmp_path):
+        input_dir = tmp_path / 'input'
+        input_dir.mkdir()
+        sys_dir = input_dir / 'SysA'
+        sys_dir.mkdir()
+        for name in ('SysA_v1_system.top', 'SysA_v1_production_rep_1.dcd', 'SysA_v1_system.pdb'):
+            (sys_dir / name).write_text('x')
+
+        cfg = {
+            'systems': ['SysA'],
+            'variations': {'SysA': ['v1']},
+            'num_replicates': 1,
+            'input_dir': str(input_dir),
+            'top_format': 'top',
+            'traj_format': 'dcd',
+        }
+
+        found, missing = validate_inputs(cfg)
+        assert found == 3
+        assert missing == []
 
     def test_idempotent(self, tmp_path):
         cfg = self._make_cfg(tmp_path)

@@ -113,6 +113,217 @@ def plot_rog(pickle_file, output_dir='.', dpi=DEFAULT_DPI, show_kde=True, label=
     print(f"Saved RoG plot to {output_path}")
 
 
+def plot_rog_comparison(pickle_files, labels, group_name, output_dir='.', dpi=DEFAULT_DPI,
+                         show_kde=True, selection_label=''):
+    """
+    Generates a Radius of Gyration comparison plot from multiple pickle files.
+
+    Parameters
+    ----------
+    pickle_files : list of str
+        Paths to RoG pickle files to overlay.
+    labels : list of str
+        Labels for each dataset (e.g., ['SystemA/wild', 'SystemB/mut']).
+    group_name : str
+        Name of the comparison group for the output filename.
+    output_dir : str
+        Directory to save the plot.
+    dpi : int
+        Output resolution.
+    show_kde : bool
+        Whether to show the KDE density sideplot.
+    selection_label : str
+        Selection context label for subtitle.
+    """
+    all_rog_data = []
+    time_unit = 'ns'
+
+    for pkl_file in pickle_files:
+        with open(pkl_file, 'rb') as f:
+            data = pickle.load(f)
+
+        if isinstance(data, dict):
+            rog_data = data['rog_obj'].rog_data
+            time_unit = data.get('time_unit', 'ns')
+        else:
+            rog_data = data.rog_data
+            time_unit = 'ns'
+
+        all_rog_data.append(rog_data)
+
+    if show_kde:
+        fig = plt.figure(figsize=DEFAULT_FIGSIZE)
+        gs = gridspec.GridSpec(1, 2, width_ratios=[4, 1], wspace=0.05)
+        ax0 = plt.subplot(gs[0])
+    else:
+        fig, ax0 = plt.subplots(figsize=DEFAULT_FIGSIZE)
+
+    colors = get_color_cycle(len(all_rog_data))
+
+    for i, (rog_data, label) in enumerate(zip(all_rog_data, labels)):
+        color = colors[i]
+        time_values = rog_data[:, 1]
+        rog_values = rog_data[:, 2]
+        mean_rog = np.mean(rog_values)
+        plot_label = format_label_with_stats(label, rog_values)
+
+        ax0.plot(time_values, rog_values, color=color, label=plot_label, lw=2.5, alpha=0.9)
+        ax0.axhline(mean_rog, color=color, linestyle='--', lw=1.2, alpha=0.5)
+
+    ax0.set_xlabel(f'Time ({time_unit_label(time_unit)})', fontsize=14, fontweight='bold')
+    ax0.set_ylabel(r'Radius of Gyration ($\AA$)', fontsize=14, fontweight='bold')
+    ax0.set_title(f'RoG Comparison: {group_name}', fontsize=16, fontweight='bold', pad=15)
+    if selection_label:
+        ax0.text(0.5, 1.01, selection_label,
+                 transform=ax0.transAxes, fontsize=10, ha='center', va='bottom',
+                 style='italic', color='gray')
+    ax0.legend(loc='lower right', fontsize=11, frameon=True)
+    apply_style(ax0)
+
+    if show_kde:
+        ax1 = plt.subplot(gs[1])
+        for i, (rog_data, label) in enumerate(zip(all_rog_data, labels)):
+            color = colors[i]
+            rog_values = rog_data[:, 2]
+            rog_range = np.linspace(rog_values.min(), rog_values.max(), 200)
+            kde = gaussian_kde(rog_values)
+            ax1.plot(kde(rog_range), rog_range, color=color, lw=2.2, label=label)
+        ax1.set_xlabel('Density', fontsize=13)
+        ax1.set_title('RoG Density', fontsize=14, pad=10)
+        ax1.set_ylabel(r'RoG ($\AA$)', fontsize=13)
+        ax1.legend(fontsize=10, frameon=True, loc='best')
+        apply_style(ax1, remove_spines=['top', 'left', 'bottom'])
+
+    fig.subplots_adjust(left=0.12, right=0.98, bottom=0.13, top=0.92, wspace=0.05)
+
+    os.makedirs(output_dir, exist_ok=True)
+    safe_name = group_name.replace(' ', '_').replace('/', '_')
+    output_path = os.path.join(output_dir, f'rog_comparison_{safe_name}.png')
+    plt.savefig(output_path, dpi=dpi, bbox_inches='tight')
+    plt.close(fig)
+    print(f"Saved RoG comparison plot to {output_path}")
+
+
+def plot_rog_comparison_average(pickle_groups, labels, group_name, output_dir='.', dpi=DEFAULT_DPI,
+                                 show_kde=True, selection_label=''):
+    """
+    Generates an averaged Radius of Gyration comparison plot.
+
+    Parameters
+    ----------
+    pickle_groups : list of list of str
+        Each inner list contains pickle files for one system/variation (across replicates).
+    labels : list of str
+        Labels for each system/variation (e.g., ['SystemA/wild', 'SystemB/mut']).
+    group_name : str
+        Name of the comparison group for the output filename.
+    output_dir : str
+        Directory to save the plot.
+    dpi : int
+        Output resolution.
+    show_kde : bool
+        Whether to show the KDE density sideplot.
+    selection_label : str
+        Selection context label for subtitle.
+    """
+    all_mean_rog = []
+    all_std_rog = []
+    all_times = []
+    time_unit = 'ns'
+    colors = get_color_cycle(len(pickle_groups))
+
+    for pkl_list in pickle_groups:
+        if not pkl_list:
+            continue
+
+        replicate_data = []
+        for pkl_file in pkl_list:
+            with open(pkl_file, 'rb') as f:
+                data = pickle.load(f)
+            if isinstance(data, dict):
+                rog_data = data['rog_obj'].rog_data
+                time_unit = data.get('time_unit', 'ns')
+            else:
+                rog_data = data.rog_data
+                time_unit = 'ns'
+            replicate_data.append(rog_data)
+
+        # Average across replicates
+        if len(replicate_data) > 1:
+            # Stack and compute mean/std across replicates
+            # Assuming same time points across replicates
+            min_len = min(len(d) for d in replicate_data)
+            stacked = np.stack([d[:min_len] for d in replicate_data])
+            time_values = stacked[0, :, 1]
+            rog_values = stacked[:, :, 2]
+            mean_rog = np.mean(rog_values, axis=0)
+            std_rog = np.std(rog_values, axis=0)
+        else:
+            time_values = replicate_data[0][:, 1]
+            mean_rog = replicate_data[0][:, 2]
+            std_rog = np.zeros_like(mean_rog)
+
+        all_mean_rog.append(mean_rog)
+        all_std_rog.append(std_rog)
+        all_times.append(time_values)
+
+    if show_kde:
+        fig = plt.figure(figsize=DEFAULT_FIGSIZE)
+        gs = gridspec.GridSpec(1, 2, width_ratios=[4, 1], wspace=0.05)
+        ax0 = plt.subplot(gs[0])
+    else:
+        fig, ax0 = plt.subplots(figsize=DEFAULT_FIGSIZE)
+
+    for i, (mean_rog, std_rog, times, label) in enumerate(zip(all_mean_rog, all_std_rog, all_times, labels)):
+        color = colors[i]
+        plot_label = f'{label} (n={len(pickle_groups[i])})'
+        ax0.plot(times, mean_rog, color=color, label=plot_label, lw=2.5, alpha=0.9)
+        ax0.fill_between(times, mean_rog - std_rog, mean_rog + std_rog, color=color, alpha=0.2)
+
+    ax0.set_xlabel(f'Time ({time_unit_label(time_unit)})', fontsize=14, fontweight='bold')
+    ax0.set_ylabel(r'Radius of Gyration ($\AA$)', fontsize=14, fontweight='bold')
+    ax0.set_title(f'RoG Comparison (Averaged): {group_name}', fontsize=16, fontweight='bold', pad=15)
+    if selection_label:
+        ax0.text(0.5, 1.01, selection_label,
+                 transform=ax0.transAxes, fontsize=10, ha='center', va='bottom',
+                 style='italic', color='gray')
+    ax0.legend(loc='lower right', fontsize=11, frameon=True)
+    apply_style(ax0)
+
+    if show_kde:
+        ax1 = plt.subplot(gs[1])
+        for i, (pkl_list, label) in enumerate(zip(pickle_groups, labels)):
+            color = colors[i]
+            # Use all replicates for density
+            all_rog = []
+            for pkl_file in pkl_list:
+                with open(pkl_file, 'rb') as f:
+                    data = pickle.load(f)
+                if isinstance(data, dict):
+                    rog_data = data['rog_obj'].rog_data
+                else:
+                    rog_data = data.rog_data
+                all_rog.append(rog_data[:, 2])
+            combined_rog = np.concatenate(all_rog)
+            rog_range = np.linspace(combined_rog.min(), combined_rog.max(), 200)
+            kde = gaussian_kde(combined_rog)
+            ax1.plot(kde(rog_range), rog_range, color=color, lw=2.2, label=label)
+        ax1.set_xlabel('Density', fontsize=13)
+        ax1.set_title('RoG Density', fontsize=14, pad=10)
+        ax1.set_ylabel(r'RoG ($\AA$)', fontsize=13)
+        ax1.legend(fontsize=10, frameon=True, loc='best')
+        apply_style(ax1, remove_spines=['top', 'left', 'bottom'])
+
+    fig.subplots_adjust(left=0.12, right=0.98, bottom=0.13, top=0.92, wspace=0.05)
+
+    os.makedirs(output_dir, exist_ok=True)
+    safe_name = group_name.replace(' ', '_').replace('/', '_')
+    output_path = os.path.join(output_dir, f'rog_comparison_avg_{safe_name}.png')
+    plt.savefig(output_path, dpi=dpi, bbox_inches='tight')
+    plt.close(fig)
+    print(f"Saved RoG averaged comparison plot to {output_path}")
+
+
 def main():
     """Main function to parse arguments and generate RoG plots."""
     parser = argparse.ArgumentParser(description='Generate Radius of Gyration plots from pickle files')

@@ -344,24 +344,93 @@ class TestPlotHBonds:
 
         mod.plot_hbonds(mock_hbonds_pickle, output_dir=str(tmp_path / 'out'), dpi=72, plot_types=['ids'])
 
-        assert captured['atom_labels_by_index'][10] == 'ASP10:OD1'
+        assert captured['atom_labels_by_index'][10] == 'ASP10'
 
-    def test_hbonds_id_label_includes_chain_suffix_when_present(self):
-        """By-ids labels should preserve per-atom chain suffixes in donor/hydrogen/acceptor labels."""
+    def test_hbonds_id_label_uses_residue_only_labels(self):
+        """By-ids labels should use residue-only labels for donor/hydrogen/acceptor atoms."""
         from plotting.plot_hbonds import _format_hbond_id_label
 
         row = np.array([10, 11, 20, 3])
         labels = {
-            10: 'TRP68:NE1 [chain=PROB]',
-            11: 'TRP68:HE1 [chain=PROB]',
-            20: 'GLN132:OE1 [chain=PROA]',
+            10: 'TRP68',
+            11: 'TRP68',
+            20: 'GLN132',
         }
 
         formatted = _format_hbond_id_label(row, labels)
 
-        assert 'D:TRP68:NE1 [chain=PROB]' in formatted
-        assert 'H:TRP68:HE1 [chain=PROB]' in formatted
-        assert 'A:GLN132:OE1 [chain=PROA]' in formatted
+        assert formatted == 'D:TRP68-H:TRP68-A:GLN132'
+
+    def test_hbonds_average_aggregates_replicates(self, tmp_path, monkeypatch):
+        """plot_hbonds_average should average replicate pickles by system/variation base name."""
+        from plotting import plot_hbonds as mod
+
+        def _make_payload(times, counts, type_counts, id_counts):
+            return {
+                'times': np.asarray(times),
+                'count_by_time': np.asarray(counts),
+                'count_by_type': np.asarray(type_counts, dtype=object),
+                'count_by_ids': np.asarray(id_counts, dtype=object),
+                'time_unit': 'ps',
+                'hbonds_preset': 'custom',
+                'atom_labels_by_index': {
+                    10: 'ASP10',
+                    11: 'ASP10',
+                    20: 'GLU20',
+                },
+            }
+
+        pkl1 = tmp_path / 'hbonds_plot_sysA_wild_rep1.pkl'
+        pkl2 = tmp_path / 'hbonds_plot_sysA_wild_rep2.pkl'
+        with open(pkl1, 'wb') as f:
+            pickle.dump(_make_payload(
+                [0.0, 1.0],
+                [2, 4],
+                [['DON', 'ACC', '2']],
+                [[10, 11, 20, 2]],
+            ), f)
+        with open(pkl2, 'wb') as f:
+            pickle.dump(_make_payload(
+                [0.0, 1.0],
+                [4, 6],
+                [['DON', 'ACC', '3']],
+                [[10, 11, 20, 3]],
+            ), f)
+
+        captured = {}
+
+        def _capture_time(times, counts, output_path, **kwargs):
+            captured['time'] = (np.asarray(times), np.asarray(counts), os.path.basename(output_path), kwargs['label'])
+
+        def _capture_type(type_counts, output_path, **kwargs):
+            captured['type'] = (np.asarray(type_counts, dtype=object), os.path.basename(output_path), kwargs['label'])
+
+        def _capture_ids(id_counts, output_path, **kwargs):
+            captured['ids'] = (np.asarray(id_counts, dtype=object), os.path.basename(output_path), kwargs['label'])
+
+        monkeypatch.setattr(mod, 'plot_hbonds_by_time', _capture_time)
+        monkeypatch.setattr(mod, 'plot_hbonds_by_type', _capture_type)
+        monkeypatch.setattr(mod, 'plot_hbonds_by_ids', _capture_ids)
+
+        mod.plot_hbonds_average([str(pkl1), str(pkl2)], output_dir=str(tmp_path / 'out'), dpi=72)
+
+        averaged_times, averaged_counts, time_name, time_label = captured['time']
+        assert time_name.endswith('_avg_by_time.png')
+        assert np.allclose(averaged_times, np.array([0.0, 1.0]))
+        assert np.allclose(averaged_counts, np.array([3.0, 5.0]))
+        assert 'average' in time_label.lower()
+
+        averaged_types, type_name, type_label = captured['type']
+        assert type_name.endswith('_avg_by_type.png')
+        assert averaged_types.shape[0] == 1
+        assert averaged_types[0][2] == 5
+        assert 'average' in type_label.lower()
+
+        averaged_ids, ids_name, ids_label = captured['ids']
+        assert ids_name.endswith('_avg_by_ids.png')
+        assert averaged_ids.shape[0] == 1
+        assert averaged_ids[0][3] == 5
+        assert ids_label == time_label
 
     def test_hbonds_legacy_schema_raises(self, tmp_path):
         """Legacy non-dict H-bonds pickles should raise a schema error."""

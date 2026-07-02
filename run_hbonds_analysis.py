@@ -128,7 +128,7 @@ def _build_hbonds_payload(hbonds, *, d_a_cutoff, d_h_a_angle_cutoff,
 
 
 def _build_atom_labels_map(universe, count_by_ids):
-    """Return atom label mapping for donor/hydrogen/acceptor ids used in count_by_ids."""
+    """Return residue-only label mapping for donor/hydrogen/acceptor ids used in count_by_ids."""
     labels = {}
     rows = np.asarray(count_by_ids)
     if rows.size == 0:
@@ -141,22 +141,6 @@ def _build_atom_labels_map(universe, count_by_ids):
         referenced.add(int(row[1]))
         referenced.add(int(row[2]))
 
-    def _resolve_chain_label(atom):
-        """Return the best available chain-like identifier for an atom."""
-        for attr in ('chainID', 'segid'):
-            try:
-                value = getattr(atom, attr)
-            except Exception:
-                value = None
-            if value is None:
-                continue
-
-            value = str(value).strip()
-            if value:
-                return value
-
-        return ''
-
     # Build a robust lookup by both atom.index and atom.id.
     try:
         atom_iter = iter(universe.atoms)
@@ -165,9 +149,7 @@ def _build_atom_labels_map(universe, count_by_ids):
 
     for atom in atom_iter:
         try:
-            base_label = f"{atom.resname}{atom.resid}:{atom.name}"
-            chain_value = _resolve_chain_label(atom)
-            label = f"{base_label} [chain={chain_value}]" if chain_value else base_label
+            label = f"{atom.resname}{atom.resid}"
             idx = int(atom.index)
             aid = int(atom.id)
         except Exception:
@@ -217,8 +199,9 @@ def _build_hbond_analysis_with_fallback(
             donors_sel=None,
             **kwargs,
         )
-    except NoDataError as first_error:
-        # Retry after bond guessing for topologies lacking explicit bonds.
+    except (NoDataError, IndexError) as first_error:
+        # Retry after bond guessing for topologies lacking explicit bonds
+        # (common for nucleic acid base hydrogens in CHARMM PSFs).
         if _guess_bonds_if_missing(universe):
             try:
                 print("INFO: Guessed bonds for H-bond analysis fallback.")
@@ -227,7 +210,7 @@ def _build_hbond_analysis_with_fallback(
                     donors_sel=None,
                     **kwargs,
                 )
-            except NoDataError:
+            except (NoDataError, IndexError):
                 pass
 
         # Final fallback: avoid topology donor-hydrogen mapping and let
@@ -329,10 +312,10 @@ def run_hbonds_analysis(systems, variations, num_replicates, d_a_cutoff, d_h_a_a
                     traj_file = wrapped_traj_file
                 else:
                     traj_file, _ = resolve_trajectory_file(
-                        system, variation, rep, traj_format
+                        system, variation, rep, traj_format, base_dir=input_dir
                     )
 
-                top_file, _ = resolve_topology_file(system, variation, top_format)
+                top_file, _ = resolve_topology_file(system, variation, top_format, base_dir=input_dir)
                 u = mda.Universe(top_file, traj_file)
 
                 # PBC handling: wrap_selection controls which atoms

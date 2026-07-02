@@ -98,10 +98,10 @@ def run_rog_analysis(systems, variations, num_replicates, start_frame, traj_form
                     traj_file = wrapped_traj_file
                 else:
                     traj_file, _ = resolve_trajectory_file(
-                        system, variation, rep, traj_format
+                        system, variation, rep, traj_format, base_dir=input_dir
                     )
 
-                top_file, _ = resolve_topology_file(system, variation, top_format)
+                top_file, _ = resolve_topology_file(system, variation, top_format, base_dir=input_dir)
                 u = mda.Universe(top_file, traj_file)
 
                 # PBC handling: wrap_selection controls which atoms

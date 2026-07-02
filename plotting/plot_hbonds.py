@@ -11,6 +11,8 @@ Reference: https://userguide.mdanalysis.org/stable/examples/analysis/hydrogen_bo
 import os
 import pickle
 import argparse
+import re
+from collections import defaultdict
 import numpy as np
 import matplotlib.pyplot as plt
 
@@ -67,6 +69,86 @@ def _format_hbond_id_label(row, atom_labels_by_index):
     hydrogen = _resolve_atom_label(row[1])
     acceptor = _resolve_atom_label(row[2])
     return f"D:{donor}-H:{hydrogen}-A:{acceptor}"
+
+
+def _normalize_hbonds_base_name(pickle_path):
+    """Return the stable replicate-independent base name for a H-bonds pickle."""
+    base_name = os.path.splitext(os.path.basename(pickle_path))[0]
+    match = re.match(r'^(?P<prefix>.+)_rep\d+$', base_name)
+    return match.group('prefix') if match else base_name
+
+
+def _group_hbonds_pickles(pickle_files):
+    """Group H-bonds pickles by replicate-independent base name."""
+    grouped = defaultdict(list)
+    for pickle_file in pickle_files:
+        grouped[_normalize_hbonds_base_name(pickle_file)].append(pickle_file)
+    return dict(sorted(grouped.items()))
+
+
+def _average_hbonds_times(payloads, target_time_unit):
+    """Average time-series counts across replicate payloads."""
+    converted_times = []
+    count_series = []
+
+    for payload in payloads:
+        source_unit = payload.get('time_unit', 'ps')
+        converted_times.append(_convert_time_units(payload['times'], source_unit, target_time_unit))
+        count_series.append(np.asarray(payload['count_by_time'], dtype=float))
+
+    min_len = min(len(series) for series in count_series)
+    if min_len == 0:
+        return np.array([]), np.array([]), target_time_unit
+
+    reference_times = converted_times[0][:min_len]
+    if any(not np.allclose(reference_times, times[:min_len]) for times in converted_times[1:]):
+        print("WARNING: H-bonds replicate time axes differ slightly; averaging by frame index.")
+
+    averaged_counts = np.mean(np.vstack([series[:min_len] for series in count_series]), axis=0)
+    return reference_times, averaged_counts, target_time_unit
+
+
+def _aggregate_hbonds_type_counts(payloads):
+    """Aggregate donor/acceptor type counts across replicate payloads."""
+    totals = defaultdict(int)
+    for payload in payloads:
+        rows = np.asarray(payload['count_by_type'])
+        for row in rows:
+            if len(row) < 3:
+                continue
+            key = (str(row[0]), str(row[1]))
+            totals[key] += int(row[2])
+
+    aggregated = [
+        [donor, acceptor, total]
+        for (donor, acceptor), total in sorted(totals.items(), key=lambda item: (-item[1], item[0][0], item[0][1]))
+    ]
+    return np.asarray(aggregated, dtype=object)
+
+
+def _aggregate_hbonds_id_counts(payloads):
+    """Aggregate donor/hydrogen/acceptor ID triplets across replicate payloads."""
+    totals = defaultdict(int)
+    labels_by_index = {}
+
+    for payload in payloads:
+        for atom_id, label in (payload.get('atom_labels_by_index') or {}).items():
+            labels_by_index.setdefault(int(atom_id), str(label))
+
+        rows = np.asarray(payload['count_by_ids'])
+        for row in rows:
+            if len(row) < 4:
+                continue
+            key = (int(row[0]), int(row[1]), int(row[2]))
+            totals[key] += int(row[3])
+
+    aggregated = [
+        [donor, hydrogen, acceptor, total]
+        for (donor, hydrogen, acceptor), total in sorted(
+            totals.items(), key=lambda item: (-item[1], item[0][0], item[0][1], item[0][2])
+        )
+    ]
+    return np.asarray(aggregated, dtype=object), labels_by_index
 
 
 def plot_hbonds_by_time(times, counts, output_path, dpi=DEFAULT_DPI, time_unit='ps',
@@ -207,6 +289,71 @@ def plot_hbonds_by_ids(id_counts, output_path, dpi=DEFAULT_DPI, top_n=20, label=
     print(f"Saved H-bonds by IDs plot to {output_path}")
 
 
+def plot_hbonds_average(pickle_files, output_dir='.', dpi=DEFAULT_DPI, plot_types=None,
+                        top_n=20, time_unit='ps', label=None):
+    """Generate averaged H-bond plots across replicate pickle files."""
+    if plot_types is None:
+        plot_types = ['time', 'type', 'ids']
+
+    grouped_pickles = _group_hbonds_pickles(pickle_files)
+    os.makedirs(output_dir, exist_ok=True)
+
+    for group_name, group_files in grouped_pickles.items():
+        payloads = []
+        for pickle_file in group_files:
+            hbonds = _load_hbonds_payload(pickle_file)
+            if not isinstance(hbonds, dict):
+                raise ValueError(
+                    "Unsupported H-bonds pickle schema. Expected a dict payload "
+                    "created by run_hbonds_analysis.py with portable arrays."
+                )
+            payloads.append(hbonds)
+
+        if not payloads:
+            continue
+
+        avg_label = label
+        if avg_label is None:
+            avg_label = prettify_label(group_name.replace('hbonds_plot_', ''))
+        avg_label = prettify_label(f'{avg_label} average')
+
+        base_name = f'{group_name}_avg'
+
+        if 'time' in plot_types:
+            times, counts, source_time_unit = _average_hbonds_times(payloads, time_unit)
+            out = os.path.join(output_dir, f'{base_name}_by_time.png')
+            plot_hbonds_by_time(
+                times,
+                counts,
+                out,
+                dpi=dpi,
+                time_unit=time_unit,
+                source_time_unit=source_time_unit,
+                label=avg_label,
+            )
+
+        if 'type' in plot_types:
+            out = os.path.join(output_dir, f'{base_name}_by_type.png')
+            plot_hbonds_by_type(
+                _aggregate_hbonds_type_counts(payloads),
+                out,
+                dpi=dpi,
+                label=avg_label,
+            )
+
+        if 'ids' in plot_types:
+            out = os.path.join(output_dir, f'{base_name}_by_ids.png')
+            id_counts, atom_labels_by_index = _aggregate_hbonds_id_counts(payloads)
+            plot_hbonds_by_ids(
+                id_counts,
+                out,
+                dpi=dpi,
+                top_n=top_n,
+                label=avg_label,
+                atom_labels_by_index=atom_labels_by_index,
+            )
+
+
 def plot_hbonds(pickle_file, output_dir='.', dpi=DEFAULT_DPI, plot_types=None,
                 top_n=20, time_unit='ps', label=None):
     """
@@ -294,8 +441,11 @@ def main():
     """Main function to parse arguments and generate H-bond plots."""
     parser = argparse.ArgumentParser(description='Generate Hydrogen Bond plots from pickle files')
 
-    parser.add_argument('--pickle-file', type=str, required=True,
-                        help='Path to the H-bonds pickle file')
+    group = parser.add_mutually_exclusive_group(required=True)
+    group.add_argument('--pickle-file', type=str,
+                       help='Path to a single H-bonds pickle file')
+    group.add_argument('--pickle-files', type=str, nargs='+',
+                       help='Paths to multiple H-bonds pickle files to average by replicate group')
     parser.add_argument('--output-dir', type=str, default='.',
                         help='Directory to save plots (default: current directory)')
     parser.add_argument('--dpi', type=int, default=DEFAULT_DPI,
@@ -312,19 +462,35 @@ def main():
 
     args = parser.parse_args()
 
-    if not os.path.exists(args.pickle_file):
-        print(f"Error: Pickle file not found: {args.pickle_file}")
-        return 1
+    if args.pickle_files:
+        missing = [path for path in args.pickle_files if not os.path.exists(path)]
+        if missing:
+            print(f"Error: Pickle file not found: {missing[0]}")
+            return 1
 
-    plot_hbonds(
-        pickle_file=args.pickle_file,
-        output_dir=args.output_dir,
-        dpi=args.dpi,
-        plot_types=args.plot_types,
-        top_n=args.top_n,
-        time_unit=args.time_unit,
-        label=args.label
-    )
+        plot_hbonds_average(
+            pickle_files=args.pickle_files,
+            output_dir=args.output_dir,
+            dpi=args.dpi,
+            plot_types=args.plot_types,
+            top_n=args.top_n,
+            time_unit=args.time_unit,
+            label=args.label,
+        )
+    else:
+        if not os.path.exists(args.pickle_file):
+            print(f"Error: Pickle file not found: {args.pickle_file}")
+            return 1
+
+        plot_hbonds(
+            pickle_file=args.pickle_file,
+            output_dir=args.output_dir,
+            dpi=args.dpi,
+            plot_types=args.plot_types,
+            top_n=args.top_n,
+            time_unit=args.time_unit,
+            label=args.label
+        )
 
     return 0
 

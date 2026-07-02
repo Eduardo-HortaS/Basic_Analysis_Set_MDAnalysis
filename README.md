@@ -12,7 +12,7 @@ Nextflow pipeline for batch execution.
 - **Named comparison plot groups** for RMSD/RMSF (`[plot_groups]`, `replicate_mode = separate|average`)
 - **2D-RMSD** pairwise distance matrix heatmaps
 - **Radius of Gyration** over time with KDE density sideplot
-- **Hydrogen Bonds** — count by time, type, and specific atom IDs
+- **Hydrogen Bonds** — count by time, type, and residue-only H-bond labels, with replicate averaging support
 - Consistent, accessible color palette and publication-quality styling
 - **Native parallelization** via MDAnalysis 2.8+ split-apply-combine (multiprocessing / Dask) for RMSD and H-bonds
 - Nextflow DSL2 pipeline with configurable per-analysis toggles and MDAnalysis parallelization support
@@ -55,8 +55,12 @@ pip install pytest pytest-html pytest-cov   # dev deps
 
 ## Directory Structure
 
-The scripts expect trajectory data organized as:
+The scripts accept trajectory data organized as either of these layouts:
 ```
+{system}/{system}_system_{variation}.top
+{system}/{system}_production_{variation}_rep_{N}.dcd
+
+# legacy nested layout still supported
 {system}/{variation}/{system}_system_{variation}.top
 {system}/{variation}/{system}_production_{variation}_rep_{N}.dcd
 ```

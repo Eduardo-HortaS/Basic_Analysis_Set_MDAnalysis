@@ -107,7 +107,7 @@ class TestHBondPresets:
 
 
 class TestHBondAtomLabelMap:
-    def test_atom_labels_include_chain_suffix(self):
+    def test_atom_labels_use_residue_only_labels(self):
         class _Atom:
             def __init__(self, index, atom_id, resname, resid, name, chain_id='', segid=''):
                 self.index = index
@@ -131,11 +131,11 @@ class TestHBondAtomLabelMap:
 
         labels = _build_atom_labels_map(universe, count_by_ids)
 
-        assert labels[10] == 'ASP10:OD1 [chain=PROA]'
-        assert labels[11] == 'ASP10:HD1 [chain=PROA]'
-        assert labels[20] == 'GLU20:OE2 [chain=PROB]'
+        assert labels[10] == 'ASP10'
+        assert labels[11] == 'ASP10'
+        assert labels[20] == 'GLU20'
 
-    def test_atom_labels_fall_back_to_segid_when_chainid_missing(self):
+    def test_atom_labels_use_residue_only_labels_without_chainid(self):
         class _Atom:
             def __init__(self, index, atom_id, resname, resid, name, segid=''):
                 self.index = index
@@ -156,9 +156,9 @@ class TestHBondAtomLabelMap:
 
         labels = _build_atom_labels_map(universe, count_by_ids)
 
-        assert labels[30] == 'SER30:OG [chain=PROC]'
+        assert labels[30] == 'SER30'
 
-    def test_atom_labels_fall_back_to_plain_label_without_chain(self):
+    def test_atom_labels_use_residue_only_labels_without_name_suffix(self):
         class _Atom:
             def __init__(self, index, atom_id, resname, resid, name):
                 self.index = index
@@ -178,7 +178,7 @@ class TestHBondAtomLabelMap:
 
         labels = _build_atom_labels_map(universe, count_by_ids)
 
-        assert labels[30] == 'SER30:OG'
+        assert labels[30] == 'SER30'
 
 
 class TestRunHBondsAnalysis:
