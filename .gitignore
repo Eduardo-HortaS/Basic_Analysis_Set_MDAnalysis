@@ -83,7 +83,7 @@ docs/
 
 # tests 
 .test_results
-
+test_chain_reordering.py
 
 # Local run configs
 /*.ini
