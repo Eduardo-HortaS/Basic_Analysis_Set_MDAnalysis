@@ -243,3 +243,119 @@ class TestRunRoGAnalysis:
                 traj_format='dcd',
                 time_unit='hours',
             )
+
+    @patch('run_rog_analysis.mda')
+    def test_rog_dcd_time_axis_correction(self, mock_mda, tmp_path):
+        """RoG with time_interval_between_frames should correct DCD time axis."""
+        os.chdir(tmp_path)
+        sys_dir = tmp_path / 'sys1' / 'wild'
+        sys_dir.mkdir(parents=True)
+        (sys_dir / 'sys1_system_wild.top').touch()
+        (sys_dir / 'sys1_production_wild_rep_1.dcd').touch()
+
+        mock_universe = MagicMock()
+        mock_mda.Universe.return_value = mock_universe
+
+        mock_protein = MagicMock()
+        mock_not_protein = MagicMock()
+        mock_selected = MagicMock()
+        mock_selected.radius_of_gyration.return_value = 16.0
+
+        def select_side_effect(sel):
+            if sel == 'protein':
+                return mock_protein
+            elif sel == 'not protein':
+                return mock_not_protein
+            else:
+                return mock_selected
+        mock_universe.select_atoms.side_effect = select_side_effect
+
+        # Mock trajectory with 3 frames, starting from frame 500
+        mock_ts1 = MagicMock()
+        mock_ts1.frame = 500
+        mock_ts1.time = 0.0  # MDAnalysis might give wrong time for DCD
+        mock_ts2 = MagicMock()
+        mock_ts2.frame = 501
+        mock_ts2.time = 0.0
+        mock_ts3 = MagicMock()
+        mock_ts3.frame = 502
+        mock_ts3.time = 0.0
+        mock_universe.trajectory.__getitem__ = MagicMock(return_value=[mock_ts1, mock_ts2, mock_ts3])
+
+        run_rog_analysis(
+            systems=['sys1'],
+            variations={'sys1': ['wild']},
+            num_replicates=1,
+            start_frame=500,
+            traj_format='dcd',
+            time_unit='ns',
+            time_interval_between_frames=2000.0,  # 2 ns per frame in ps
+        )
+
+        pkl = tmp_path / 'rog_plot_sys1_wild_rep1.pkl'
+        assert pkl.exists()
+
+        with open(pkl, 'rb') as f:
+            data = pickle.load(f)
+
+        # Time should be corrected: frame 500 * 2000 ps = 1000000 ps = 1000 ns
+        # frame 501 * 2000 ps = 1002000 ps = 1002 ns
+        # frame 502 * 2000 ps = 1004000 ps = 1004 ns
+        np.testing.assert_almost_equal(data['rog_obj'].rog_data[0, 1], 1000.0)
+        np.testing.assert_almost_equal(data['rog_obj'].rog_data[1, 1], 1002.0)
+        np.testing.assert_almost_equal(data['rog_obj'].rog_data[2, 1], 1004.0)
+
+    @patch('run_rog_analysis.mda')
+    def test_rog_no_correction_for_xtc(self, mock_mda, tmp_path):
+        """RoG should not apply correction for non-DCD formats even if time_interval_between_frames is set."""
+        os.chdir(tmp_path)
+        sys_dir = tmp_path / 'sys1' / 'wild'
+        sys_dir.mkdir(parents=True)
+        (sys_dir / 'sys1_system_wild.top').touch()
+        (sys_dir / 'sys1_production_wild_rep_1.xtc').touch()
+
+        mock_universe = MagicMock()
+        mock_mda.Universe.return_value = mock_universe
+
+        mock_protein = MagicMock()
+        mock_not_protein = MagicMock()
+        mock_selected = MagicMock()
+        mock_selected.radius_of_gyration.return_value = 16.0
+
+        def select_side_effect(sel):
+            if sel == 'protein':
+                return mock_protein
+            elif sel == 'not protein':
+                return mock_not_protein
+            else:
+                return mock_selected
+        mock_universe.select_atoms.side_effect = select_side_effect
+
+        # Mock trajectory with actual time values
+        mock_ts1 = MagicMock()
+        mock_ts1.frame = 500
+        mock_ts1.time = 1000000.0  # 1000 ns in ps
+        mock_ts2 = MagicMock()
+        mock_ts2.frame = 501
+        mock_ts2.time = 1002000.0
+        mock_universe.trajectory.__getitem__ = MagicMock(return_value=[mock_ts1, mock_ts2])
+
+        run_rog_analysis(
+            systems=['sys1'],
+            variations={'sys1': ['wild']},
+            num_replicates=1,
+            start_frame=500,
+            traj_format='xtc',
+            time_unit='ns',
+            time_interval_between_frames=2000.0,  # Should be ignored for XTC
+        )
+
+        pkl = tmp_path / 'rog_plot_sys1_wild_rep1.pkl'
+        assert pkl.exists()
+
+        with open(pkl, 'rb') as f:
+            data = pickle.load(f)
+
+        # Time should use MDAnalysis trajectory timestamps, not the interval
+        np.testing.assert_almost_equal(data['rog_obj'].rog_data[0, 1], 1000.0)
+        np.testing.assert_almost_equal(data['rog_obj'].rog_data[1, 1], 1002.0)

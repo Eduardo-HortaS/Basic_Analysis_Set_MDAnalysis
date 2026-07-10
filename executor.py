@@ -684,6 +684,7 @@ def run_rog(cfg, dry_run=False):
         require_reference_pdb=True,
         output_dir=os.path.join(cfg['_work_dir'], _ANALYSIS_SUBDIRS['rog']),
         strict_wrapping=cfg['strict_wrapping'],
+        time_interval_between_frames=cfg.get('time_interval_between_frames'),
     )
 
 

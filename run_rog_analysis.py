@@ -42,7 +42,7 @@ RoGResults.__module__ = 'run_rog_analysis'
 #   selection = 'protein'              # All protein atoms
 #   selection = 'nucleic'              # All nucleic acid atoms
 
-def run_rog_analysis(systems, variations, num_replicates, start_frame, traj_format, top_format='top', selection='protein and backbone', time_unit='ns', wrap_selection='auto', output_dir=None, strict_wrapping=False, wrapped_manifest=None, input_dir=None, require_reference_pdb=False):
+def run_rog_analysis(systems, variations, num_replicates, start_frame, traj_format, top_format='top', selection='protein and backbone', time_unit='ns', wrap_selection='auto', output_dir=None, strict_wrapping=False, wrapped_manifest=None, input_dir=None, require_reference_pdb=False, time_interval_between_frames=None):
     """
     Runs the Radius of Gyration analysis for each system and variation and saves results as individual pickle files.
 
@@ -60,6 +60,12 @@ def run_rog_analysis(systems, variations, num_replicates, start_frame, traj_form
     output_dir : str or None, optional
         Directory for pickle output.  When *None* (default), pickles are
         written to the current working directory.
+    time_interval_between_frames : float, optional
+        Time interval between frames in picoseconds. Used for DCD time-axis
+        correction when trajectory format is DCD. When provided and
+        traj_format is 'dcd', recalculates the time axis from frame indices
+        instead of relying on MDAnalysis trajectory timestamps (which can be
+        unreliable for DCD files). Default: None.
     """
     validate_time_unit(time_unit)
     if output_dir:
@@ -117,17 +123,36 @@ def run_rog_analysis(systems, variations, num_replicates, start_frame, traj_form
 
                 print("Calculating Radius of Gyration...")
 
+                # Determine if we need DCD time-axis correction
+                # DCD files often lack proper timestep info, so use time_interval_between_frames if provided
+                use_dcd_time_correction = (
+                    time_interval_between_frames is not None and
+                    traj_format.lower() == 'dcd'
+                )
+
                 # Store results
                 rog_results = []
                 frames = []
                 times = []
 
                 # Iterate through trajectory starting from start_frame
-                for ts in u.trajectory[start_frame:]:
-                    rog_value = selected_atoms.radius_of_gyration()
-                    rog_results.append(rog_value)
-                    frames.append(ts.frame)
-                    times.append(convert_time_from_ps(ts.time, time_unit))
+                if use_dcd_time_correction:
+                    # Calculate time from frame index and time interval
+                    # ts.frame gives the absolute frame index, so we use that directly
+                    for ts in u.trajectory[start_frame:]:
+                        rog_value = selected_atoms.radius_of_gyration()
+                        rog_results.append(rog_value)
+                        frames.append(ts.frame)
+                        # Time = frame_index * time_interval_between_frames (in ps), then convert to target unit
+                        time_ps = ts.frame * time_interval_between_frames
+                        times.append(convert_time_from_ps(time_ps, time_unit))
+                else:
+                    # Use MDAnalysis trajectory timestamps (default behavior)
+                    for ts in u.trajectory[start_frame:]:
+                        rog_value = selected_atoms.radius_of_gyration()
+                        rog_results.append(rog_value)
+                        frames.append(ts.frame)
+                        times.append(convert_time_from_ps(ts.time, time_unit))
 
                 rog_analysis_results = RoGResults(frames, times, rog_results)
 
@@ -164,6 +189,10 @@ def main():
                         help='MDAnalysis selection string for atoms to calculate RoG (default: "protein and backbone")')
     parser.add_argument('--time-unit', type=str, default='ns', choices=list(SUPPORTED_TIME_UNITS),
                         help='Output time unit (default: ns)')
+
+    # DCD time-axis correction
+    parser.add_argument('--time-interval-between-frames', type=float, default=None,
+                        help='Time interval between frames in picoseconds (for DCD time-axis correction)')
 
     # PBC wrapping control
     parser.add_argument('--wrap-selection', type=str, default='auto',
@@ -203,6 +232,7 @@ def main():
         time_unit=args.time_unit,
         wrap_selection=None if args.wrap_selection.lower() == 'none' else args.wrap_selection,
         strict_wrapping=args.strict_wrapping,
+        time_interval_between_frames=args.time_interval_between_frames,
     )
 
     return 0
