@@ -290,7 +290,10 @@ def resolve_trajectory_file(system, variation, rep, traj_format, base_dir=None):
         # Legacy style with variation: system_production_variation_rep_N.ext
         f'{system}/{system}_production_{variation}_rep_{rep}.{traj_format}',
         f'{system}/{system}_production_{variation}_rep{rep}.{traj_format}',
-        # Nested variation directory
+        # Nested variation directory with new naming style
+        f'{system}/{variation}/{system}{var_suffix}_production_rep_{rep}.{traj_format}',
+        f'{system}/{variation}/{system}{var_suffix}_production_rep{rep}.{traj_format}',
+        # Nested variation directory with legacy naming style
         f'{system}/{variation}/{system}_production_{variation}_rep_{rep}.{traj_format}',
         f'{system}/{variation}/{system}_production_{variation}_rep{rep}.{traj_format}',
     ]
@@ -326,7 +329,9 @@ def resolve_topology_file(system, variation, top_format, base_dir=None):
         f'{system}/{system}{var_suffix}_system.{top_format}',
         # Legacy style with variation: system_system_variation.ext
         f'{system}/{system}_system_{variation}.{top_format}',
-        # Nested variation directory
+        # Nested variation directory with new naming style
+        f'{system}/{variation}/{system}{var_suffix}_system.{top_format}',
+        # Nested variation directory with legacy naming style
         f'{system}/{variation}/{system}_system_{variation}.{top_format}',
     ]
 
@@ -359,7 +364,9 @@ def resolve_reference_pdb_file(system, variation, base_dir=None):
         f'{system}/{system}{var_suffix}_system.pdb',
         # Legacy style with variation: system_system_variation.pdb
         f'{system}/{system}_system_{variation}.pdb',
-        # Nested variation directory
+        # Nested variation directory with new naming style
+        f'{system}/{variation}/{system}{var_suffix}_system.pdb',
+        # Nested variation directory with legacy naming style
         f'{system}/{variation}/{system}_system_{variation}.pdb',
     ]
 
