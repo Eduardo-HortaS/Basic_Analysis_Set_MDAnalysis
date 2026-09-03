@@ -31,7 +31,9 @@ def _cfg_to_nf_params(cfg: dict) -> dict:
 
     # Systems  ────────────────────────────────────────────────────────────
     params['systems'] = json.dumps(cfg['systems'])
-    params['variations'] = json.dumps(cfg['variations'])
+    # Handle optional variations - executor.py now auto-generates defaults
+    params['variations'] = json.dumps(cfg.get('variations', {system: ['default'] for system in cfg['systems']}))
+    params['default_variation'] = cfg.get('default_variation', 'default')
     params['num_replicates'] = cfg['num_replicates']
     params['traj_format'] = cfg['traj_format']
     params['top_format'] = cfg['top_format']

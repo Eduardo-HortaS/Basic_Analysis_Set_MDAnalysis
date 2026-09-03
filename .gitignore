@@ -76,6 +76,7 @@ rmsd_plot*
 params.yml
 params_*.yml
 docs/
+test_input/
 
 # Local validation reports (root-generated)
 *.md

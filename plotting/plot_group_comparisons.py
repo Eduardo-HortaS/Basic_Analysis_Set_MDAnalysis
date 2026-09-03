@@ -59,7 +59,12 @@ def _parse_bool(value: Any) -> bool:
 
 
 def _parse_plot_groups(raw_value: str) -> dict[str, list[tuple[str, str]]]:
-    """Parse plot_groups from JSON text or a JSON file path."""
+    """Parse plot_groups from JSON text or a JSON file path.
+
+    Members can be:
+    - [system, variation] - system with specific variation
+    - [system] - system only, uses empty variation (no variation in filename)
+    """
     value = raw_value.strip()
     if not value:
         return {}
@@ -81,11 +86,16 @@ def _parse_plot_groups(raw_value: str) -> dict[str, list[tuple[str, str]]]:
 
         validated: list[tuple[str, str]] = []
         for member in members:
-            if not isinstance(member, (list, tuple)) or len(member) != 2:
+            if not isinstance(member, (list, tuple)) or len(member) not in (1, 2):
                 print(f"WARNING: plot group '{group_name}' has invalid member {member!r}. Skipping member.")
                 continue
-            system, variation = member
-            validated.append((str(system), str(variation)))
+            if len(member) == 2:
+                system, variation = member
+                validated.append((str(system), str(variation)))
+            else:
+                # System only - use empty variation
+                system = member[0]
+                validated.append((str(system), ''))
 
         if validated:
             parsed[str(group_name)] = validated
@@ -105,16 +115,19 @@ def _find_pickle_for_member(work_dir: str, prefix: str, system: str, variation: 
                             rep: int, sel_idx: int | None = None,
                             ref_idx: int | None = None) -> str | None:
     """Find a pickle matching system/variation/rep with optional ref/sel suffixes."""
+    # Build variation suffix: omit when empty
+    var_suffix = f"_{variation}" if variation else ""
+
     ref_part = f'_ref{ref_idx}' if ref_idx is not None else ''
     if sel_idx is not None:
-        pattern = os.path.join(work_dir, f'{prefix}_{system}_{variation}_rep{rep}{ref_part}_sel{sel_idx}.pkl')
+        pattern = os.path.join(work_dir, f'{prefix}_{system}{var_suffix}_rep{rep}{ref_part}_sel{sel_idx}.pkl')
     else:
-        pattern = os.path.join(work_dir, f'{prefix}_{system}_{variation}_rep{rep}{ref_part}.pkl')
+        pattern = os.path.join(work_dir, f'{prefix}_{system}{var_suffix}_rep{rep}{ref_part}.pkl')
     matches = glob.glob(pattern)
     if matches:
         return matches[0]
 
-    pattern = os.path.join(work_dir, f'{prefix}_{system}_{variation}_rep{rep}{ref_part}*.pkl')
+    pattern = os.path.join(work_dir, f'{prefix}_{system}{var_suffix}_rep{rep}{ref_part}*.pkl')
     matches = glob.glob(pattern)
     return matches[0] if matches else None
 
@@ -365,20 +378,110 @@ def _find_pickle_for_rmsf_member(work_dir: str, system: str, variation: str,
                                  rep: int, sel_idx: int | None = None,
                                  chain_id: str | None = None) -> str | None:
     """Find an RMSF pickle matching system/variation/rep with optional sel/chain suffixes."""
+    # Build variation suffix: omit when empty
+    var_suffix = f"_{variation}" if variation else ""
+
     sel_part = f'_sel{sel_idx}' if sel_idx is not None else ''
     chain_part = f'_chain{chain_id}' if chain_id is not None else ''
-    
-    pattern = os.path.join(work_dir, f'rmsf_plot_{system}_{variation}_rep{rep}{sel_part}{chain_part}.pkl')
+
+    pattern = os.path.join(work_dir, f'rmsf_plot_{system}{var_suffix}_rep{rep}{sel_part}{chain_part}.pkl')
     matches = glob.glob(pattern)
     if matches:
         return matches[0]
     return None
 
 
+def _find_rog_pickle(work_dir: str, system: str, variation: str, rep: int) -> str | None:
+    """Find a RoG pickle matching system/variation/rep."""
+    # Build variation suffix: omit when empty
+    var_suffix = f"_{variation}" if variation else ""
+
+    pattern = os.path.join(work_dir, f'rog_plot_{system}{var_suffix}_rep{rep}.pkl')
+    matches = glob.glob(pattern)
+    if matches:
+        return matches[0]
+    return None
+
+
+def _plot_rog_groups(plot_groups: dict[str, list[tuple[str, str]]], *, work_dir: str,
+                     output_dir: str, num_replicates: int, dpi: int,
+                     replicate_mode: str, rog_show_kde: bool) -> int:
+    """Generate RoG comparison plots for each named plot_group."""
+    from plotting.plot_rog import plot_rog_comparison, plot_rog_comparison_average
+
+    produced = 0
+
+    for group_name, members in plot_groups.items():
+        if replicate_mode == 'average':
+            pickle_groups = []
+            labels = []
+
+            for system, variation in members:
+                rep_pickles = []
+                for rep in range(1, num_replicates + 1):
+                    pkl = _find_rog_pickle(work_dir, system, variation, rep)
+                    if pkl and os.path.exists(pkl):
+                        rep_pickles.append(pkl)
+                if rep_pickles:
+                    pickle_groups.append(rep_pickles)
+                    labels.append(f'{system} / {variation or "default"}')
+
+            if not pickle_groups:
+                print(f"WARNING: No RoG pickles found for group '{group_name}'. Skipping.")
+                return produced
+
+            gname = group_name.strip()
+            print(f"Plotting averaged RoG comparison: {gname}")
+            plot_rog_comparison_average(
+                pickle_groups,
+                labels,
+                gname,
+                output_dir=output_dir,
+                dpi=dpi,
+                show_kde=rog_show_kde,
+                selection_label='',
+            )
+            produced += 1
+        else:
+            plotted_for_group = False
+            for rep in range(1, num_replicates + 1):
+                pkl_files = []
+                labels = []
+
+                for system, variation in members:
+                    pkl = _find_rog_pickle(work_dir, system, variation, rep)
+                    if pkl and os.path.exists(pkl):
+                        pkl_files.append(pkl)
+                        labels.append(f'{system} / {variation or "default"}')
+
+                if not pkl_files:
+                    continue
+
+                rep_suffix = f'_rep{rep}' if num_replicates > 1 else ''
+                gname = f'{group_name}{rep_suffix}'.strip()
+                print(f"Plotting RoG comparison: {gname}")
+                plot_rog_comparison(
+                    pkl_files,
+                    labels,
+                    gname,
+                    output_dir=output_dir,
+                    dpi=dpi,
+                    show_kde=rog_show_kde,
+                    selection_label='',
+                )
+                produced += 1
+                plotted_for_group = True
+
+            if not plotted_for_group:
+                print(f"WARNING: No RoG pickles found for group '{group_name}'. Skipping.")
+
+    return produced
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description='Generate grouped RMSD/RMSF comparison plots from pickles.')
-    parser.add_argument('--analysis', required=True, choices=('rmsd', 'rmsf'))
+    parser.add_argument('--analysis', required=True, choices=('rmsd', 'rmsf', 'rog'))
     parser.add_argument('--plot-groups', required=True,
                         help='JSON object or JSON file path with group definitions')
     parser.add_argument('--work-dir', default='.')
@@ -388,6 +491,7 @@ def main() -> None:
     parser.add_argument('--dpi', type=int, default=400)
     parser.add_argument('--target-selection', default='protein and backbone')
     parser.add_argument('--rmsd-show-kde', default='true')
+    parser.add_argument('--rog-show-kde', default='true')
     args = parser.parse_args()
 
     plot_groups = _parse_plot_groups(args.plot_groups)
@@ -397,6 +501,7 @@ def main() -> None:
 
     replicate_mode = _normalize_replicate_mode(args.replicate_mode)
     rmsd_show_kde = _parse_bool(args.rmsd_show_kde)
+    rog_show_kde = _parse_bool(args.rog_show_kde)
     os.makedirs(args.output_dir, exist_ok=True)
 
     if args.analysis == 'rmsd':
@@ -409,7 +514,7 @@ def main() -> None:
             replicate_mode=replicate_mode,
             rmsd_show_kde=rmsd_show_kde,
         )
-    else:
+    elif args.analysis == 'rmsf':
         count = _plot_rmsf_groups(
             plot_groups,
             work_dir=args.work_dir,
@@ -418,6 +523,16 @@ def main() -> None:
             dpi=args.dpi,
             replicate_mode=replicate_mode,
             target_selection=args.target_selection,
+        )
+    else:  # rog
+        count = _plot_rog_groups(
+            plot_groups,
+            work_dir=args.work_dir,
+            output_dir=args.output_dir,
+            num_replicates=args.num_replicates,
+            dpi=args.dpi,
+            replicate_mode=replicate_mode,
+            rog_show_kde=rog_show_kde,
         )
 
     print(f'Generated {count} grouped {args.analysis.upper()} comparison plot(s).')

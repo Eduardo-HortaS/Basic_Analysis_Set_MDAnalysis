@@ -23,7 +23,8 @@ nextflow.enable.dsl = 2
 
 // ─── Default Parameters ──────────────────────────────────────────────────────
 params.systems          = null    // JSON string or path: e.g., '["Ung_G-C_4"]'
-params.variations       = null    // JSON string or path: e.g., '{"Ung_G-C_4": ["wild"]}'
+params.variations       = null    // JSON string or path: e.g., '{"Ung_G-C_4": ["wild"]}' — optional; defaults to empty variation (no variation in filename)
+params.default_variation = ''  // Default variation name when --variations not provided (empty = no variation in filename)
 params.num_replicates   = 1
 params.traj_format      = 'dcd'
 params.top_format       = 'top'
@@ -93,8 +94,8 @@ def get_script_dir() { return "${projectDir}" }
 
 workflow {
     // Parse systems and variations
-    if (!params.systems || !params.variations) {
-        error "ERROR: --systems and --variations must be provided."
+    if (!params.systems) {
+        error "ERROR: --systems must be provided."
     }
 
     // time_interval_between_frames is mandatory — it cannot be inferred from
@@ -107,9 +108,13 @@ workflow {
     }
 
     // Create a channel of [system, variation, rep] tuples
+    // When variations is not provided, uses empty string "" (no variation in filename)
     Channel
         .fromList(generate_combinations())
         .set { analysis_inputs }
+
+    // Track if variations were explicitly provided (for display purposes)
+    cfg_has_variations = params.variations != null
 
     def _plot_groups_map = parse_plot_groups(params.plot_groups)
     def _has_plot_groups = !_plot_groups_map.isEmpty()
@@ -152,6 +157,9 @@ workflow {
         RUN_ROG(wrapped_inputs)
         if (params.plot_rog) {
             PLOT_ROG(RUN_ROG.out.pickle)
+            if (_has_plot_groups) {
+                PLOT_ROG_GROUPS(RUN_ROG.out.pickle)
+            }
         }
     }
 
@@ -166,7 +174,6 @@ workflow {
 
 // ─── Helper function ─────────────────────────────────────────────────────────
 
-
 def generate_combinations() {
     def jsonSlurper = new groovy.json.JsonSlurper()
     def systems
@@ -180,12 +187,21 @@ def generate_combinations() {
         systems = jsonSlurper.parseText(params.systems.toString())
     }
 
-    // Parse variations
-    def variations_file = new File(params.variations.toString())
-    if (variations_file.exists()) {
-        variations = jsonSlurper.parse(variations_file)
+    // Parse variations — if not provided, auto-generate empty variation per system
+    // Empty variation results in simpler file naming (no _default_ in filenames)
+    if (params.variations) {
+        def variations_file = new File(params.variations.toString())
+        if (variations_file.exists()) {
+            variations = jsonSlurper.parse(variations_file)
+        } else {
+            variations = jsonSlurper.parseText(params.variations.toString())
+        }
     } else {
-        variations = jsonSlurper.parseText(params.variations.toString())
+        // Auto-generate: each system gets an empty variation (no _default_ in filenames)
+        variations = [:]
+        systems.each { system ->
+            variations[system] = [""]  // Empty string = no variation in filename
+        }
     }
 
     def combos = []
@@ -202,6 +218,9 @@ def generate_combinations() {
 }
 
 def resolve_top_file(system, variation) {
+    // Check if variation is empty (auto-generated when not provided) - if so, also try files without variation in name
+    def is_empty_variation = (variation == "" || variation == null)
+
     def flat = file("${params.input_dir}/${system}/${system}_${variation}_system.${params.top_format}")
     if (flat.exists()) {
         return flat
@@ -210,6 +229,14 @@ def resolve_top_file(system, variation) {
     def flatLegacy = file("${params.input_dir}/${system}/${system}_system_${variation}.${params.top_format}")
     if (flatLegacy.exists()) {
         return flatLegacy
+    }
+
+    // For empty variation, also try files without variation suffix
+    if (is_empty_variation) {
+        def flatNoVar = file("${params.input_dir}/${system}/${system}_system.${params.top_format}")
+        if (flatNoVar.exists()) {
+            return flatNoVar
+        }
     }
 
     def nested = file("${params.input_dir}/${system}/${variation}/${system}_system_${variation}.${params.top_format}")
@@ -221,6 +248,9 @@ def resolve_top_file(system, variation) {
 }
 
 def resolve_traj_file(system, variation, rep) {
+    // Check if variation is empty (auto-generated when not provided) - if so, also try files without variation in name
+    def is_empty_variation = (variation == "" || variation == null)
+
     def flatUnderscore = file("${params.input_dir}/${system}/${system}_${variation}_production_rep_${rep}.${params.traj_format}")
     if (flatUnderscore.exists()) {
         return flatUnderscore
@@ -239,6 +269,18 @@ def resolve_traj_file(system, variation, rep) {
     def flatLegacyNoUnderscore = file("${params.input_dir}/${system}/${system}_production_${variation}_rep${rep}.${params.traj_format}")
     if (flatLegacyNoUnderscore.exists()) {
         return flatLegacyNoUnderscore
+    }
+
+    // For empty variation, also try files without variation in name
+    if (is_empty_variation) {
+        def flatSimpleUnderscore = file("${params.input_dir}/${system}/${system}_production_rep_${rep}.${params.traj_format}")
+        if (flatSimpleUnderscore.exists()) {
+            return flatSimpleUnderscore
+        }
+        def flatSimpleNoUnderscore = file("${params.input_dir}/${system}/${system}_production_rep${rep}.${params.traj_format}")
+        if (flatSimpleNoUnderscore.exists()) {
+            return flatSimpleNoUnderscore
+        }
     }
 
     def withUnderscore = file("${params.input_dir}/${system}/${variation}/${system}_production_${variation}_rep_${rep}.${params.traj_format}")
@@ -313,7 +355,9 @@ process RUN_WRAP {
     tuple val(system), val(variation), val(rep), path(top_file), path("wrapped_${system}_production_${variation}_rep${rep}.${params.traj_format}"), emit: wrapped
 
     script:
-    def wrappedName = "wrapped_${system}_production_${variation}_rep${rep}.${params.traj_format}"
+    // Build variation suffix: omit when empty, include with underscore when not
+    def var_part = variation ? "_${variation}" : ""
+    def wrappedName = "wrapped_${system}_production${var_part}_rep${rep}.${params.traj_format}"
     """
     persisted_dir="${params.outdir}/wrapped"
     persisted_file="\$persisted_dir/${wrappedName}"
@@ -369,8 +413,11 @@ process RUN_RMSD {
     input:
     tuple val(system), val(variation), val(rep), path(top_file), path(traj_file)
 
+    // Build variation suffix: omit when empty, include with underscore when not
+    def var_suffix = variation ? "_${variation}" : ""
+
     output:
-    path("rmsd_plot_${system}_${variation}_rep${rep}*.pkl"), emit: pickle
+    path("rmsd_plot_${system}${var_suffix}_rep${rep}*.pkl"), emit: pickle
 
     script:
     def time_arg = params.time_interval_between_frames ? "--time-interval-between-frames ${params.time_interval_between_frames} --time-unit ${params.time_unit}" : ""
@@ -404,13 +451,12 @@ process RUN_RMSD {
     def strict_arg = ""
     def parallel_arg = params.parallel_backend != 'serial' ? "--parallel-backend ${params.parallel_backend}" : ""
     def nworkers_arg = params.n_workers ? "--n-workers ${params.n_workers}" : ""
+    def pkl_rep1_pattern = "rmsd_plot_${system}${var_suffix}_rep1*.pkl"
     """
     mkdir -p ${system}/${variation}
     ln -sf \$(readlink -f ${top_file}) ${system}/${variation}/${system}_system_${variation}.${params.top_format}
     ln -sf \$(readlink -f ${traj_file}) ${system}/${variation}/${system}_production_${variation}_rep_1.${params.traj_format}
     ln -sf \$(readlink -f ${traj_file}) ${system}/${variation}/${system}_production_${variation}_rep1.${params.traj_format}
-
-    cp -f ${params.outdir}/rmsd/rmsd_plot_${system}_${variation}_rep${rep}*.pkl . 2>/dev/null || true
 
     python ${get_script_dir()}/run_rms_analysis.py \\
         --systems '["${system}"]' \\
@@ -424,7 +470,7 @@ process RUN_RMSD {
         --top-format ${params.top_format} \\
         ${time_arg} ${group_arg} ${wrap_arg} ${strict_arg} ${parallel_arg} ${nworkers_arg}
 
-    for f in rmsd_plot_${system}_${variation}_rep1*.pkl; do
+    for f in ${pkl_rep1_pattern}; do
         if [ -e "\$f" ]; then
             newname=\$(echo "\$f" | sed "s/rep1/rep${rep}/")
             [ "\$f" != "\$newname" ] && mv "\$f" "\$newname" || true
@@ -442,8 +488,11 @@ process RUN_RMSF {
     input:
     tuple val(system), val(variation), val(rep), path(top_file), path(traj_file)
 
+    // Build variation suffix: omit when empty, include with underscore when not
+    def var_suffix = variation ? "_${variation}" : ""
+
     output:
-    path("rmsf_plot_${system}_${variation}_rep${rep}*.pkl"), emit: pickle
+    path("rmsf_plot_${system}${var_suffix}_rep${rep}*.pkl"), emit: pickle
 
     script:
     def chain_arg = params.chain_intervals ? "--chain-intervals '${params.chain_intervals}'" : ""
@@ -475,13 +524,12 @@ process RUN_RMSF {
     def group_arg = group_selections_list ? "--group-selections ${group_selections_list.collect { "'${it.toString().replace("'", "'\\''")}'" }.join(' ')}" : ""
     def wrap_arg = "--wrap-selection none"
     def strict_arg = ""
+    def pkl_rep1_pattern = "rmsf_plot_${system}${var_suffix}_rep1*.pkl"
     """
     mkdir -p ${system}/${variation}
     ln -sf \$(readlink -f ${top_file}) ${system}/${variation}/${system}_system_${variation}.${params.top_format}
     ln -sf \$(readlink -f ${traj_file}) ${system}/${variation}/${system}_production_${variation}_rep_1.${params.traj_format}
     ln -sf \$(readlink -f ${traj_file}) ${system}/${variation}/${system}_production_${variation}_rep1.${params.traj_format}
-
-    cp -f ${params.outdir}/rmsf/rmsf_plot_${system}_${variation}_rep${rep}*.pkl . 2>/dev/null || true
 
     python ${get_script_dir()}/run_rms_analysis.py \\
         --systems '["${system}"]' \\
@@ -495,7 +543,7 @@ process RUN_RMSF {
         --top-format ${params.top_format} \\
         ${chain_arg} ${group_arg} ${wrap_arg} ${strict_arg}
 
-    for f in rmsf_plot_${system}_${variation}_rep1*.pkl; do
+    for f in ${pkl_rep1_pattern}; do
         newname=\$(echo "\$f" | sed "s/rep1/rep${rep}/")
         [ "\$f" != "\$newname" ] && mv "\$f" "\$newname" || true
     done
@@ -511,19 +559,22 @@ process RUN_2D_RMSD {
     input:
     tuple val(system), val(variation), val(rep), path(top_file), path(traj_file)
 
+    // Build variation suffix: omit when empty, include with underscore when not
+    def var_suffix = variation ? "_${variation}" : ""
+
     output:
-    path("2d_rmsd_plot_${system}_${variation}_rep${rep}.pkl"), emit: pickle
+    path("2d_rmsd_plot_${system}${var_suffix}_rep${rep}.pkl"), emit: pickle
 
     script:
     def wrap_arg = "--wrap-selection none"
     def strict_arg = ""
+    def pkl_rep1_name = "2d_rmsd_plot_${system}${var_suffix}_rep1.pkl"
+    def pkl_name = "2d_rmsd_plot_${system}${var_suffix}_rep${rep}.pkl"
     """
     mkdir -p ${system}/${variation}
     ln -sf \$(readlink -f ${top_file}) ${system}/${variation}/${system}_system_${variation}.${params.top_format}
     ln -sf \$(readlink -f ${traj_file}) ${system}/${variation}/${system}_production_${variation}_rep_1.${params.traj_format}
     ln -sf \$(readlink -f ${traj_file}) ${system}/${variation}/${system}_production_${variation}_rep1.${params.traj_format}
-
-    cp -f ${params.outdir}/2d_rmsd/2d_rmsd_plot_${system}_${variation}_rep${rep}.pkl . 2>/dev/null || true
 
     python ${get_script_dir()}/run_rms_analysis.py \\
         --systems '["${system}"]' \\
@@ -537,7 +588,7 @@ process RUN_2D_RMSD {
         --top-format ${params.top_format} \\
         ${wrap_arg} ${strict_arg}
 
-    mv 2d_rmsd_plot_${system}_${variation}_rep1.pkl 2d_rmsd_plot_${system}_${variation}_rep${rep}.pkl || true
+    mv ${pkl_rep1_name} ${pkl_name} || true
     """
 }
 
@@ -550,19 +601,22 @@ process RUN_ROG {
     input:
     tuple val(system), val(variation), val(rep), path(top_file), path(traj_file)
 
+    // Build variation suffix: omit when empty, include with underscore when not
+    def var_suffix = variation ? "_${variation}" : ""
+
     output:
-    path("rog_plot_${system}_${variation}_rep${rep}.pkl"), emit: pickle
+    path("rog_plot_${system}${var_suffix}_rep${rep}.pkl"), emit: pickle
 
     script:
     def wrap_arg = "--wrap-selection none"
     def strict_arg = ""
+    def pkl_rep1_name = "rog_plot_${system}${var_suffix}_rep1.pkl"
+    def pkl_name = "rog_plot_${system}${var_suffix}_rep${rep}.pkl"
     """
     mkdir -p ${system}/${variation}
     ln -sf \$(readlink -f ${top_file}) ${system}/${variation}/${system}_system_${variation}.${params.top_format}
     ln -sf \$(readlink -f ${traj_file}) ${system}/${variation}/${system}_production_${variation}_rep_1.${params.traj_format}
     ln -sf \$(readlink -f ${traj_file}) ${system}/${variation}/${system}_production_${variation}_rep1.${params.traj_format}
-
-    cp -f ${params.outdir}/rog/rog_plot_${system}_${variation}_rep${rep}.pkl . 2>/dev/null || true
 
     python ${get_script_dir()}/run_rog_analysis.py \\
         --systems '["${system}"]' \\
@@ -575,7 +629,7 @@ process RUN_ROG {
         --time-unit ${params.time_unit} \\
         ${wrap_arg} ${strict_arg}
 
-    mv rog_plot_${system}_${variation}_rep1.pkl rog_plot_${system}_${variation}_rep${rep}.pkl || true
+    mv ${pkl_rep1_name} ${pkl_name} || true
     """
 }
 
@@ -589,8 +643,11 @@ process RUN_HBONDS {
     input:
     tuple val(system), val(variation), val(rep), path(top_file), path(traj_file)
 
+    // Build variation suffix: omit when empty, include with underscore when not
+    def var_suffix = variation ? "_${variation}" : ""
+
     output:
-    path("hbonds_plot_${system}_${variation}_rep${rep}.pkl"), emit: pickle
+    path("hbonds_plot_${system}${var_suffix}_rep${rep}.pkl"), emit: pickle
 
     script:
     def sel_arg = ""
@@ -614,13 +671,13 @@ process RUN_HBONDS {
     def strict_arg = ""
     def parallel_arg = params.parallel_backend != 'serial' ? "--parallel-backend ${params.parallel_backend}" : ""
     def nworkers_arg = params.n_workers ? "--n-workers ${params.n_workers}" : ""
+    def pkl_rep1_name = "hbonds_plot_${system}${var_suffix}_rep1.pkl"
+    def pkl_name = "hbonds_plot_${system}${var_suffix}_rep${rep}.pkl"
     """
     mkdir -p ${system}/${variation}
     ln -sf \$(readlink -f ${top_file}) ${system}/${variation}/${system}_system_${variation}.${params.top_format}
     ln -sf \$(readlink -f ${traj_file}) ${system}/${variation}/${system}_production_${variation}_rep_1.${params.traj_format}
     ln -sf \$(readlink -f ${traj_file}) ${system}/${variation}/${system}_production_${variation}_rep1.${params.traj_format}
-
-    cp -f ${params.outdir}/hbonds/hbonds_plot_${system}_${variation}_rep${rep}.pkl . 2>/dev/null || true
 
     python ${get_script_dir()}/run_hbonds_analysis.py \\
         --systems '["${system}"]' \\
@@ -634,7 +691,7 @@ process RUN_HBONDS {
         ${update_arg} \\
         ${sel_arg} ${wrap_arg} ${strict_arg} ${parallel_arg} ${nworkers_arg}
 
-    mv hbonds_plot_${system}_${variation}_rep1.pkl hbonds_plot_${system}_${variation}_rep${rep}.pkl || true
+    mv ${pkl_rep1_name} ${pkl_name} || true
     """
 }
 
@@ -677,7 +734,7 @@ process PLOT_RMSD_GROUPS {
         ? groovy.json.JsonOutput.toJson(params.plot_groups)
         : params.plot_groups
     """
-    python ${get_script_dir()}/plotting/plot_group_comparisons.py \
+    python ${get_script_dir()}/plotting/plot_group_comparisons.py \\
         --analysis rmsd \\
         --plot-groups '${plotGroupsArg}' \\
         --work-dir '${params.outdir}/rmsd' \\
@@ -726,7 +783,7 @@ process PLOT_RMSF_GROUPS {
         ? groovy.json.JsonOutput.toJson(params.plot_groups)
         : params.plot_groups
     """
-    python ${get_script_dir()}/plotting/plot_group_comparisons.py \
+    python ${get_script_dir()}/plotting/plot_group_comparisons.py \\
         --analysis rmsf \\
         --plot-groups '${plotGroupsArg}' \\
         --work-dir '${params.outdir}/rmsf' \\
@@ -780,6 +837,34 @@ process PLOT_ROG {
     """
 }
 
+process PLOT_ROG_GROUPS {
+    label 'process_low'
+    publishDir "${params.outdir}/plots/rog", mode: 'copy'
+    cache 'lenient'
+
+    input:
+    path(plot_pngs)
+
+    output:
+    path("rog_comparison_*.png"), emit: plot, optional: true
+
+    script:
+    def plotGroupsArg = (params.plot_groups instanceof Map || params.plot_groups instanceof Collection)
+        ? groovy.json.JsonOutput.toJson(params.plot_groups)
+        : params.plot_groups
+    """
+    python ${get_script_dir()}/plotting/plot_group_comparisons.py \\
+        --analysis rog \\
+        --plot-groups '${plotGroupsArg}' \\
+        --work-dir '${params.outdir}/rog' \\
+        --output-dir . \\
+        --num-replicates ${params.num_replicates} \\
+        --replicate-mode '${params.replicate_mode}' \\
+        --dpi ${params.dpi} \\
+        --rog-show-kde ${params.rog_show_kde}
+    """
+}
+
 process PLOT_HBONDS {
     tag "${pickle.baseName}"
     label 'process_low'
@@ -816,11 +901,11 @@ process PLOT_HBONDS_AVERAGE {
 
     script:
     """
-    python ${get_script_dir()}/plotting/plot_hbonds.py \
-        --pickle-files ${pickles} \
-        --output-dir . \
-        --dpi ${params.dpi} \
-        --time-unit ${params.time_unit} \
+    python ${get_script_dir()}/plotting/plot_hbonds.py \\
+        --pickle-files ${pickles} \\
+        --output-dir . \\
+        --dpi ${params.dpi} \\
+        --time-unit ${params.time_unit} \\
         --top-n ${params.hbonds_top_n}
     """
 }

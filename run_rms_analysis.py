@@ -324,7 +324,9 @@ def run_rms_analysis(systems, variations, num_replicates, analysis, target_selec
                     traj_file, _ = resolve_trajectory_file(
                         system, variation, rep, traj_format, base_dir=input_dir
                     )
-                aligned_traj_file = f'rmsfit_{system}_production_{variation}_reduced_rep{rep}.{traj_format}'
+                # Build variation suffix: empty string when variation is empty
+                var_suffix = f"_{variation}" if variation else ""
+                aligned_traj_file = f'rmsfit_{system}_production{var_suffix}_reduced_rep{rep}.{traj_format}'
                 top_file, _ = resolve_topology_file(system, variation, top_format, base_dir=input_dir)
 
                 if analysis == 'RMSD':
@@ -344,7 +346,7 @@ def run_rms_analysis(systems, variations, num_replicates, analysis, target_selec
                         transform_trajectory(u, complex_ag, rest_ag,
                                              ligand_selection=ligand_ag)
 
-                        wrapped_traj_local = f'wrapped_{system}_production_{variation}_rep{rep}.{traj_format}'
+                        wrapped_traj_local = f'wrapped_{system}_production{var_suffix}_rep{rep}.{traj_format}'
                         if not os.path.exists(wrapped_traj_local):
                             print(f"Creating wrapped trajectory (serial pre-processing): {wrapped_traj_local}")
                             with mda.Writer(wrapped_traj_local, n_atoms=u.atoms.n_atoms) as writer:
@@ -369,9 +371,9 @@ def run_rms_analysis(systems, variations, num_replicates, analysis, target_selec
                         # sel_idx == 0 corresponds to target_selection and writes
                         # the canonical base file expected by pipeline processes.
                         if sel_idx == 0:
-                            pkl_name = _pkl(f'{analysis_file_prefix[analysis]}_{system}_{variation}_rep{rep}{ref_suffix}.pkl')
+                            pkl_name = _pkl(f'{analysis_file_prefix[analysis]}_{system}{var_suffix}_rep{rep}{ref_suffix}.pkl')
                         else:
-                            pkl_name = _pkl(f'{analysis_file_prefix[analysis]}_{system}_{variation}_rep{rep}{ref_suffix}_sel{sel_idx - 1}.pkl')
+                            pkl_name = _pkl(f'{analysis_file_prefix[analysis]}_{system}{var_suffix}_rep{rep}{ref_suffix}_sel{sel_idx - 1}.pkl')
 
                         if os.path.exists(pkl_name):
                             print(f"Skipping RMSD (selection {sel_idx}: '{sel_string}') for {system}, {variation}, replicate {rep} — pickle already exists.")
@@ -507,9 +509,9 @@ def run_rms_analysis(systems, variations, num_replicates, analysis, target_selec
                             # sel_idx == 0 corresponds to target_selection and writes
                             # the canonical base file expected by pipeline processes.
                             if sel_idx == 0:
-                                pkl_name_template = f'{analysis_file_prefix[analysis]}_{system}_{variation}_rep{rep}.pkl'
+                                pkl_name_template = f'{analysis_file_prefix[analysis]}_{system}{var_suffix}_rep{rep}.pkl'
                             else:
-                                pkl_name_template = f'{analysis_file_prefix[analysis]}_{system}_{variation}_rep{rep}_sel{sel_idx - 1}.pkl'
+                                pkl_name_template = f'{analysis_file_prefix[analysis]}_{system}{var_suffix}_rep{rep}_sel{sel_idx - 1}.pkl'
 
                             # Validate that the selection exists in the universe
                             try:
@@ -578,9 +580,9 @@ def run_rms_analysis(systems, variations, num_replicates, analysis, target_selec
                                     }
 
                                     if sel_idx == 0:
-                                        chain_pkl = _pkl(f'{analysis_file_prefix[analysis]}_{system}_{variation}_rep{rep}_chain{chain_id}.pkl')
+                                        chain_pkl = _pkl(f'{analysis_file_prefix[analysis]}_{system}{var_suffix}_rep{rep}_chain{chain_id}.pkl')
                                     else:
-                                        chain_pkl = _pkl(f'{analysis_file_prefix[analysis]}_{system}_{variation}_rep{rep}_sel{sel_idx - 1}_chain{chain_id}.pkl')
+                                        chain_pkl = _pkl(f'{analysis_file_prefix[analysis]}_{system}{var_suffix}_rep{rep}_sel{sel_idx - 1}_chain{chain_id}.pkl')
 
                                     with open(chain_pkl, 'wb') as f:
                                         pickle.dump(chain_result, f)
@@ -613,7 +615,7 @@ def run_rms_analysis(systems, variations, num_replicates, analysis, target_selec
                             'ref_selection': ref_selection,
                         }
 
-                        with open(_pkl(f'{analysis_file_prefix[analysis]}_{system}_{variation}_rep{rep}.pkl'), 'wb') as f:
+                        with open(_pkl(f'{analysis_file_prefix[analysis]}_{system}{var_suffix}_rep{rep}.pkl'), 'wb') as f:
                             pickle.dump(matrix_result, f)
 
     print(f"Finished {analysis} calculation for all systems, conditions, and replicates.")
@@ -625,8 +627,10 @@ def main():
 
     parser.add_argument('--systems', type=str, required=True,
                         help='JSON string or file path containing list of systems (e.g., \'["6q2b", "5h3r"]\')')
-    parser.add_argument('--variations', type=str, required=True,
-                        help='JSON string or file path containing variations dict (e.g., \'{"6q2b": ["wild", "k84r"]}\')')
+    parser.add_argument('--variations', type=str, required=False, default=None,
+                        help='JSON string or file path containing variations dict (e.g., \'{"6q2b": ["wild", "k84r"]}\'). Optional: when not provided, no variation is used in filenames.')
+    parser.add_argument('--default-variation', type=str, default='',
+                        help='Default variation name when --variations not provided (default: empty string, meaning no variation in filename)')
     parser.add_argument('--num-replicates', type=int, default=3,
                         help='Number of replicates per system and variation (default: 3)')
     parser.add_argument('--traj-format', type=str, default='dcd',
@@ -682,11 +686,16 @@ def main():
         else:
             systems = json.loads(args.systems)
 
-        if os.path.isfile(args.variations):
-            with open(args.variations, 'r', encoding='utf-8') as f:
-                variations = json.load(f)
+        if args.variations:
+            if os.path.isfile(args.variations):
+                with open(args.variations, 'r', encoding='utf-8') as f:
+                    variations = json.load(f)
+            else:
+                variations = json.loads(args.variations)
         else:
-            variations = json.loads(args.variations)
+            # Auto-generate empty variation for each system (no variation in filename)
+            variations = {system: [args.default_variation] for system in systems}
+            print(f"  NOTE: No '--variations' provided. Using empty variation (no variation in filename).")
     except (json.JSONDecodeError, FileNotFoundError) as e:
         print(f"Error parsing JSON: {e}")
         return 1

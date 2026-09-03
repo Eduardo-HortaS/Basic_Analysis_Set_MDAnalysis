@@ -174,8 +174,10 @@ def main():
 
     parser.add_argument('--systems', type=str, required=True,
                         help='JSON string or file path containing list of systems (e.g., \'["6q2b", "5h3r"]\')')
-    parser.add_argument('--variations', type=str, required=True,
-                        help='JSON string or file path containing variations dict (e.g., \'{"6q2b": ["wild", "k84r"]}\')')
+    parser.add_argument('--variations', type=str, required=False, default=None,
+                        help='JSON string or file path containing variations dict (e.g., \'{"6q2b": ["wild", "k84r"]}\'). Optional: when not provided, no variation is used in filenames.')
+    parser.add_argument('--default-variation', type=str, default='',
+                        help='Default variation name when --variations not provided (default: empty string, meaning no variation in filename)')
     parser.add_argument('--num-replicates', type=int, default=3,
                         help='Number of replicates per system and variation (default: 3)')
     parser.add_argument('--traj-format', type=str, default='dcd',
@@ -211,11 +213,16 @@ def main():
         else:
             systems = json.loads(args.systems)
 
-        if os.path.isfile(args.variations):
-            with open(args.variations, 'r', encoding='utf-8') as f:
-                variations = json.load(f)
+        if args.variations:
+            if os.path.isfile(args.variations):
+                with open(args.variations, 'r', encoding='utf-8') as f:
+                    variations = json.load(f)
+            else:
+                variations = json.loads(args.variations)
         else:
-            variations = json.loads(args.variations)
+            # Auto-generate empty variation for each system (no variation in filename)
+            variations = {system: [args.default_variation] for system in systems}
+            print(f"  NOTE: No '--variations' provided. Using empty variation (no variation in filename).")
     except (json.JSONDecodeError, FileNotFoundError) as e:
         print(f"Error parsing JSON: {e}")
         return 1

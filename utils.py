@@ -246,12 +246,15 @@ def align_trajectory(universe, selection, analysis, system, variation, rep, traj
     """
     Aligns trajectory data based on the given selection.
     """
+    # Build variation suffix: empty string when variation is empty
+    var_suffix = f"_{variation}" if variation else ""
+
     if analysis == "RMSF":
         average = align.AverageStructure(universe, universe, select=selection, ref_frame=0).run()
         ref_rmsf = average.results.universe
-        _ = align.AlignTraj(universe, ref_rmsf, select=selection, filename=f"rmsfit_{system}_production_{variation}_reduced_rep{rep}.{traj_format}", in_memory=False).run(start=start_frame, stop=None, step=1)
+        _ = align.AlignTraj(universe, ref_rmsf, select=selection, filename=f"rmsfit_{system}_production{var_suffix}_reduced_rep{rep}.{traj_format}", in_memory=False).run(start=start_frame, stop=None, step=1)
     elif analysis == "2D-RMSD":
-        _ = align.AlignTraj(universe, universe, select=selection, filename=f"rmsfit_{system}_production_{variation}_reduced_rep{rep}.{traj_format}", in_memory=False).run(start=start_frame, stop=None, step=1)
+        _ = align.AlignTraj(universe, universe, select=selection, filename=f"rmsfit_{system}_production{var_suffix}_reduced_rep{rep}.{traj_format}", in_memory=False).run(start=start_frame, stop=None, step=1)
 
 
 def resolve_trajectory_file(system, variation, rep, traj_format, base_dir=None):
@@ -260,7 +263,8 @@ def resolve_trajectory_file(system, variation, rep, traj_format, base_dir=None):
     Parameters
     ----------
     system, variation : str
-        System and variation labels.
+        System and variation labels. When variation is empty string,
+        files are looked for without variation in the name.
     rep : int
         Replicate number.
     traj_format : str
@@ -276,14 +280,28 @@ def resolve_trajectory_file(system, variation, rep, traj_format, base_dir=None):
         existing candidate (or the legacy default if none exists), and
         ``candidates`` contains both attempted paths in priority order.
     """
+    # Build variation suffix: empty string when variation is empty
+    var_suffix = f"_{variation}" if variation else ""
+
     candidates = [
-        f'{system}/{system}_{variation}_production_rep_{rep}.{traj_format}',
-        f'{system}/{system}_{variation}_production_rep{rep}.{traj_format}',
+        # New style with variation: system_variation_production_rep_N.ext
+        f'{system}/{system}{var_suffix}_production_rep_{rep}.{traj_format}',
+        f'{system}/{system}{var_suffix}_production_rep{rep}.{traj_format}',
+        # Legacy style with variation: system_production_variation_rep_N.ext
         f'{system}/{system}_production_{variation}_rep_{rep}.{traj_format}',
         f'{system}/{system}_production_{variation}_rep{rep}.{traj_format}',
+        # Nested variation directory
         f'{system}/{variation}/{system}_production_{variation}_rep_{rep}.{traj_format}',
         f'{system}/{variation}/{system}_production_{variation}_rep{rep}.{traj_format}',
     ]
+
+    # When variation is empty, also try files without variation in the name
+    if not variation:
+        candidates.extend([
+            # New style without variation: system_production_rep_N.ext
+            f'{system}/{system}_production_rep_{rep}.{traj_format}',
+            f'{system}/{system}_production_rep{rep}.{traj_format}',
+        ])
 
     for rel_path in candidates:
         path = os.path.join(base_dir, rel_path) if base_dir else rel_path
@@ -295,12 +313,30 @@ def resolve_trajectory_file(system, variation, rep, traj_format, base_dir=None):
 
 
 def resolve_topology_file(system, variation, top_format, base_dir=None):
-    """Return the expected topology path for a system/variation."""
+    """Return the expected topology path for a system/variation.
+
+    When variation is empty string, files are looked for without variation
+    in the name.
+    """
+    # Build variation suffix: empty string when variation is empty
+    var_suffix = f"_{variation}" if variation else ""
+
     candidates = [
-        f'{system}/{system}_{variation}_system.{top_format}',
+        # New style with variation: system_variation_system.ext
+        f'{system}/{system}{var_suffix}_system.{top_format}',
+        # Legacy style with variation: system_system_variation.ext
         f'{system}/{system}_system_{variation}.{top_format}',
+        # Nested variation directory
         f'{system}/{variation}/{system}_system_{variation}.{top_format}',
     ]
+
+    # When variation is empty, also try files without variation in the name
+    if not variation:
+        candidates.extend([
+            # Without variation: system_system.ext
+            f'{system}/{system}_system.{top_format}',
+        ])
+
     for rel_path in candidates:
         path = os.path.join(base_dir, rel_path) if base_dir else rel_path
         if os.path.isfile(path):
@@ -310,12 +346,30 @@ def resolve_topology_file(system, variation, top_format, base_dir=None):
 
 
 def resolve_reference_pdb_file(system, variation, base_dir=None):
-    """Return required reference PDB path for chain metadata."""
+    """Return required reference PDB path for chain metadata.
+
+    When variation is empty string, files are looked for without variation
+    in the name.
+    """
+    # Build variation suffix: empty string when variation is empty
+    var_suffix = f"_{variation}" if variation else ""
+
     candidates = [
-        f'{system}/{system}_{variation}_system.pdb',
+        # New style with variation: system_variation_system.pdb
+        f'{system}/{system}{var_suffix}_system.pdb',
+        # Legacy style with variation: system_system_variation.pdb
         f'{system}/{system}_system_{variation}.pdb',
+        # Nested variation directory
         f'{system}/{variation}/{system}_system_{variation}.pdb',
     ]
+
+    # When variation is empty, also try files without variation in the name
+    if not variation:
+        candidates.extend([
+            # Without variation: system_system.pdb
+            f'{system}/{system}_system.pdb',
+        ])
+
     for rel_path in candidates:
         path = os.path.join(base_dir, rel_path) if base_dir else rel_path
         if os.path.isfile(path):

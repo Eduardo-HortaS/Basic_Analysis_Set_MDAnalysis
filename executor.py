@@ -175,7 +175,16 @@ def load_config(ini_path):
         sys.exit(1)
 
     cfg['systems'] = _parse_json_or_path(cp.get('systems', 'systems'))
-    cfg['variations'] = _parse_json_or_path(cp.get('systems', 'variations'))
+    # Variations is optional - if not provided, use empty string for each system
+    raw_variations = cp.get('systems', 'variations', fallback='').strip()
+    if raw_variations:
+        cfg['variations'] = _parse_json_or_path(raw_variations)
+    else:
+        # Auto-generate empty variation for each system (no variation in filename)
+        default_var = cp.get('systems', 'default_variation', fallback='').strip()
+        cfg['variations'] = {system: [default_var] for system in cfg['systems']}
+        cfg['default_variation'] = default_var
+        print(f"  NOTE: No 'variations' specified in [systems]. Using empty variation (no variation in filename).")
     cfg['num_replicates'] = cp.getint('systems', 'num_replicates', fallback=3)
     cfg['traj_format'] = cp.get('systems', 'traj_format', fallback='dcd').strip()
     cfg['top_format'] = cp.get('systems', 'top_format', fallback='top').strip()
@@ -384,13 +393,17 @@ def load_config(ini_path):
                 if not isinstance(members, list):
                     print(f"WARNING: plot_groups.{key} must be a JSON list of [system, variation] pairs. Skipping.")
                     continue
-                # Validate each member
+                # Validate each member - can be [system, variation] or [system] (variation defaults to empty)
                 validated = []
                 for m in members:
-                    if not isinstance(m, list) or len(m) != 2:
-                        print(f"WARNING: plot_groups.{key}: each entry must be [system, variation]. Got {m!r}. Skipping entry.")
+                    if not isinstance(m, list) or len(m) not in (1, 2):
+                        print(f"WARNING: plot_groups.{key}: each entry must be [system] or [system, variation]. Got {m!r}. Skipping entry.")
                         continue
-                    validated.append(tuple(m))
+                    if len(m) == 1:
+                        # System only - use empty variation
+                        validated.append((str(m[0]), ''))
+                    else:
+                        validated.append((str(m[0]), str(m[1])))
                 if validated:
                     cfg['plot_groups'][key] = validated
             except json.JSONDecodeError as e:
@@ -749,7 +762,9 @@ def _collect_pickles(work_dir, prefix, cfg, analysis_type=None, prune_stale_dupl
     for system in cfg['systems']:
         for variation in cfg['variations'][system]:
             for rep in range(1, cfg['num_replicates'] + 1):
-                patterns.append(os.path.join(search_dir, f'{prefix}_{system}_{variation}_rep{rep}*.pkl'))
+                # Build variation suffix: omit when empty
+                var_suffix = f"_{variation}" if variation else ""
+                patterns.append(os.path.join(search_dir, f'{prefix}_{system}{var_suffix}_rep{rep}*.pkl'))
 
     pickles = []
     for pat in patterns:
@@ -862,18 +877,48 @@ def plot_rmsf_results(cfg, work_dir, dry_run=False):
 
 def _find_pickle_for_member(work_dir, prefix, system, variation, rep, sel_idx=None, ref_idx=None):
     """Find a pickle file matching the given system/variation/rep/selection/ref."""
+    # Build variation suffix: omit when empty
+    var_suffix = f"_{variation}" if variation else ""
+
     ref_part = f'_ref{ref_idx}' if ref_idx is not None else ''
     if sel_idx is not None:
-        pattern = os.path.join(work_dir, f'{prefix}_{system}_{variation}_rep{rep}{ref_part}_sel{sel_idx}.pkl')
+        pattern = os.path.join(work_dir, f'{prefix}_{system}{var_suffix}_rep{rep}{ref_part}_sel{sel_idx}.pkl')
     else:
-        pattern = os.path.join(work_dir, f'{prefix}_{system}_{variation}_rep{rep}{ref_part}.pkl')
+        pattern = os.path.join(work_dir, f'{prefix}_{system}{var_suffix}_rep{rep}{ref_part}.pkl')
     matches = glob.glob(pattern)
     if matches:
         return matches[0]
     # Fallback: try wildcard (handles both sel and non-sel cases)
-    pattern = os.path.join(work_dir, f'{prefix}_{system}_{variation}_rep{rep}{ref_part}*.pkl')
+    pattern = os.path.join(work_dir, f'{prefix}_{system}{var_suffix}_rep{rep}{ref_part}*.pkl')
     matches = glob.glob(pattern)
     return matches[0] if matches else None
+
+
+def _find_pickle_for_rmsf_member(work_dir, system, variation, rep, sel_idx=None, chain_id=None):
+    """Find an RMSF pickle matching system/variation/rep with optional sel/chain suffixes."""
+    # Build variation suffix: omit when empty
+    var_suffix = f"_{variation}" if variation else ""
+
+    sel_part = f'_sel{sel_idx}' if sel_idx is not None else ''
+    chain_part = f'_chain{chain_id}' if chain_id is not None else ''
+
+    pattern = os.path.join(work_dir, f'rmsf_plot_{system}{var_suffix}_rep{rep}{sel_part}{chain_part}.pkl')
+    matches = glob.glob(pattern)
+    if matches:
+        return matches[0]
+    return None
+
+
+def _find_rog_pickle(work_dir, system, variation, rep):
+    """Find a RoG pickle matching system/variation/rep."""
+    # Build variation suffix: omit when empty
+    var_suffix = f"_{variation}" if variation else ""
+
+    pattern = os.path.join(work_dir, f'rog_plot_{system}{var_suffix}_rep{rep}.pkl')
+    matches = glob.glob(pattern)
+    if matches:
+        return matches[0]
+    return None
 
 
 def _detect_selection_indices(work_dir, prefix, cfg):
@@ -883,9 +928,11 @@ def _detect_selection_indices(work_dir, prefix, cfg):
     has_base = False
     for system in cfg['systems']:
         for variation in cfg['variations'][system]:
+            # Build variation suffix: omit when empty
+            var_suffix = f"_{variation}" if variation else ""
             for rep in range(1, cfg['num_replicates'] + 1):
                 # Check for _selN files
-                pattern = os.path.join(work_dir, f'{prefix}_{system}_{variation}_rep{rep}*_sel*.pkl')
+                pattern = os.path.join(work_dir, f'{prefix}_{system}{var_suffix}_rep{rep}*_sel*.pkl')
                 for match in glob.glob(pattern):
                     basename = os.path.basename(match)
                     import re
@@ -893,7 +940,7 @@ def _detect_selection_indices(work_dir, prefix, cfg):
                     if m:
                         sel_indices.add(int(m.group(1)))
                 # Check for base file (no _sel suffix)
-                base_pattern = os.path.join(work_dir, f'{prefix}_{system}_{variation}_rep{rep}.pkl')
+                base_pattern = os.path.join(work_dir, f'{prefix}_{system}{var_suffix}_rep{rep}.pkl')
                 if glob.glob(base_pattern):
                     has_base = True
     # Always include None (base selection) if base files exist
@@ -910,8 +957,10 @@ def _detect_ref_indices(work_dir, prefix, cfg):
     ref_indices = set()
     for system in cfg['systems']:
         for variation in cfg['variations'][system]:
+            # Build variation suffix: omit when empty
+            var_suffix = f"_{variation}" if variation else ""
             for rep in range(1, cfg['num_replicates'] + 1):
-                pattern = os.path.join(work_dir, f'{prefix}_{system}_{variation}_rep{rep}_ref*.pkl')
+                pattern = os.path.join(work_dir, f'{prefix}_{system}{var_suffix}_rep{rep}_ref*.pkl')
                 for match in glob.glob(pattern):
                     basename = os.path.basename(match)
                     import re
@@ -1177,6 +1226,85 @@ def _plot_rmsf_comparison_groups(cfg, work_dir, plot_dir, all_pickles, dry_run):
                             )
 
 
+def _plot_rog_comparison_groups(cfg, work_dir, plot_dir, all_pickles, dry_run):
+    """Generate RoG comparison plots for each named plot_group."""
+    from plotting.plot_rog import plot_rog_comparison, plot_rog_comparison_average
+
+    replicate_mode = cfg.get('replicate_mode', 'separate')
+    rog_show_kde = cfg.get('rog_show_kde', True)
+
+    for group_name, members in cfg['plot_groups'].items():
+        if replicate_mode == 'average':
+            pickle_groups = []
+            labels = []
+
+            for system, variation in members:
+                rep_pickles = []
+                for rep in range(1, cfg['num_replicates'] + 1):
+                    pkl = _find_rog_pickle(work_dir, system, variation, rep)
+                    if pkl and os.path.exists(pkl):
+                        rep_pickles.append(pkl)
+                if rep_pickles:
+                    pickle_groups.append(rep_pickles)
+                    labels.append(f'{system} / {variation}')
+
+            if not pickle_groups:
+                print(f"WARNING: No RoG pickles found for group '{group_name}'. Skipping.")
+                continue
+
+            gname = group_name.strip()
+            if dry_run:
+                print(f"  [DRY RUN] Would plot averaged RoG comparison: {gname}")
+                continue
+
+            print(f"  Plotting averaged RoG comparison: {gname}")
+            plot_rog_comparison_average(
+                pickle_groups,
+                labels,
+                gname,
+                output_dir=plot_dir,
+                dpi=cfg['dpi'],
+                show_kde=rog_show_kde,
+                selection_label='',
+            )
+        else:
+            plotted_for_group = False
+            for rep in range(1, cfg['num_replicates'] + 1):
+                pkl_files = []
+                labels = []
+
+                for system, variation in members:
+                    pkl = _find_rog_pickle(work_dir, system, variation, rep)
+                    if pkl and os.path.exists(pkl):
+                        pkl_files.append(pkl)
+                        labels.append(f'{system} / {variation}')
+
+                if not pkl_files:
+                    continue
+
+                rep_suffix = f'_rep{rep}' if cfg['num_replicates'] > 1 else ''
+                gname = f'{group_name}{rep_suffix}'.strip()
+
+                if dry_run:
+                    print(f"  [DRY RUN] Would plot RoG comparison: {gname}")
+                    continue
+
+                print(f"  Plotting RoG comparison: {gname}")
+                plot_rog_comparison(
+                    pkl_files,
+                    labels,
+                    gname,
+                    output_dir=plot_dir,
+                    dpi=cfg['dpi'],
+                    show_kde=rog_show_kde,
+                    selection_label='',
+                )
+                plotted_for_group = True
+
+            if not plotted_for_group:
+                print(f"WARNING: No RoG pickles found for group '{group_name}'. Skipping.")
+
+
 def plot_2d_rmsd_results(cfg, work_dir, dry_run=False):
     """Plot all 2D-RMSD results."""
     from plotting.plot_2d_rmsd import plot_2d_rmsd
@@ -1239,7 +1367,7 @@ def _plot_rog_comparison_groups(cfg, work_dir, plot_dir, all_pickles, dry_run):
             for system, variation in members:
                 rep_pickles = []
                 for rep in range(1, cfg['num_replicates'] + 1):
-                    pkl = _find_pickle_for_member(work_dir, 'rog_plot', system, variation, rep)
+                    pkl = _find_rog_pickle(work_dir, system, variation, rep)
                     if pkl and os.path.exists(pkl):
                         rep_pickles.append(pkl)
                 if rep_pickles:
@@ -1269,7 +1397,7 @@ def _plot_rog_comparison_groups(cfg, work_dir, plot_dir, all_pickles, dry_run):
                 labels = []
 
                 for system, variation in members:
-                    pkl = _find_pickle_for_member(work_dir, 'rog_plot', system, variation, rep)
+                    pkl = _find_rog_pickle(work_dir, system, variation, rep)
                     if pkl and os.path.exists(pkl):
                         pkl_files.append(pkl)
                         labels.append(f'{system} / {variation}')
